@@ -1,53 +1,22 @@
 package worker
 
 import (
+	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
+	"reflect"
+	"testing"
+
 	"github.com/turbonomic/kubeturbo/pkg/discovery/monitoring/kubelet"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/task"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 	api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"reflect"
-	"testing"
-	"time"
 )
 
-func TestCalTimeOut(t *testing.T) {
-	type Pair struct {
-		nodeNum int
-		timeout time.Duration
-	}
-
-	inputs := []*Pair{
-		&Pair{
-			nodeNum: 0,
-			timeout: defaultMonitoringWorkerTimeout,
-		},
-		&Pair{
-			nodeNum: 22,
-			timeout: defaultMonitoringWorkerTimeout + time.Second*22,
-		},
-		&Pair{
-			nodeNum: 500,
-			timeout: defaultMonitoringWorkerTimeout + time.Second*500,
-		},
-		&Pair{
-			nodeNum: 1500,
-			timeout: defaultMaxTimeout,
-		},
-	}
-
-	for _, input := range inputs {
-		result := calcTimeOut(input.nodeNum)
-		if result != input.timeout {
-			t.Errorf("tiemout error: %v Vs. %v", result, input.timeout)
-		}
-	}
-}
-
 func TestBuildDTOsWithMissingMetrics(t *testing.T) {
-	workerConfig := NewK8sDiscoveryWorkerConfig("UUID").WithMonitoringWorkerConfig(kubelet.NewKubeletMonitorConfig(nil))
-	worker, err := NewK8sDiscoveryWorker(workerConfig, "wid-1")
+	workerConfig := NewK8sDiscoveryWorkerConfig("UUID", 1, 1).
+		WithMonitoringWorkerConfig(kubelet.NewKubeletMonitorConfig(nil, nil))
+	worker, err := NewK8sDiscoveryWorker(workerConfig, "wid-1", metrics.NewEntityMetricSink(), true)
 	if err != nil {
 		t.Errorf("Error while creating discovery worker: %v", err)
 	}

@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"fmt"
 	"github.com/golang/glog"
 	"github.com/turbonomic/turbo-go-sdk/pkg"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
@@ -41,6 +42,47 @@ func NewAccountDefEntryBuilder(name, displayName, description, verificationRegex
 
 func (builder *AccountDefEntryBuilder) Create() *proto.AccountDefEntry {
 	return builder.accountDefEntry
+}
+
+// Action Merge Policy Metadata
+type ActionMergePolicyBuilder struct {
+	ActionMergePolicyMap map[proto.EntityDTO_EntityType]map[proto.ActionItemDTO_ActionType]*proto.ActionMergePolicyDTO
+}
+
+func NewActionMergePolicyBuilder() *ActionMergePolicyBuilder {
+	return &ActionMergePolicyBuilder{
+		ActionMergePolicyMap: make(map[proto.EntityDTO_EntityType]map[proto.ActionItemDTO_ActionType]*proto.ActionMergePolicyDTO),
+	}
+}
+
+func (builder *ActionMergePolicyBuilder) ForResizeAction(entityType proto.EntityDTO_EntityType,
+	resizeMergePolicy *ResizeMergePolicyBuilder) *ActionMergePolicyBuilder {
+	_, exists := builder.ActionMergePolicyMap[entityType]
+	if !exists {
+		builder.ActionMergePolicyMap[entityType] =
+			make(map[proto.ActionItemDTO_ActionType]*proto.ActionMergePolicyDTO)
+	}
+	entityPolicies, _ := builder.ActionMergePolicyMap[entityType]
+
+	resizePolicy, err := resizeMergePolicy.Build()
+	if err != nil {
+		fmt.Errorf("%v", err)
+	}
+	entityPolicies[proto.ActionItemDTO_RESIZE] = resizePolicy
+
+	return builder
+}
+
+func (builder *ActionMergePolicyBuilder) Create() []*proto.ActionMergePolicyDTO {
+	var policies []*proto.ActionMergePolicyDTO
+
+	for _, entityPolicies := range builder.ActionMergePolicyMap {
+		for _, val := range entityPolicies {
+			policies = append(policies, val)
+		}
+	}
+
+	return policies
 }
 
 // Action Policy Metadata
@@ -103,13 +145,14 @@ type ProbeInfoBuilder struct {
 }
 
 // NewProbeInfoBuilder builds the ProbeInfo DTO for the given probe
-func NewProbeInfoBuilder(probeType, probeCat string,
+func NewProbeInfoBuilder(probeType, probeCat, probeUICat string,
 	supplyChainSet []*proto.TemplateDTO,
 	acctDef []*proto.AccountDefEntry) *ProbeInfoBuilder {
 	// New ProbeInfo protobuf with this input
 	probeInfo := &proto.ProbeInfo{
 		ProbeType:                &probeType,
 		ProbeCategory:            &probeCat,
+		UiProbeCategory:          &probeUICat,
 		SupplyChainDefinitionSet: supplyChainSet,
 		AccountDefinition:        acctDef,
 	}
@@ -119,11 +162,12 @@ func NewProbeInfoBuilder(probeType, probeCat string,
 }
 
 // NewBasicProbeInfoBuilder builds the ProbeInfo DTO for the given probe
-func NewBasicProbeInfoBuilder(probeType, probeCat string) *ProbeInfoBuilder {
+func NewBasicProbeInfoBuilder(probeType, probeCat, probeUICat string) *ProbeInfoBuilder {
 
 	probeInfo := &proto.ProbeInfo{
-		ProbeType:     &probeType,
-		ProbeCategory: &probeCat,
+		ProbeType:       &probeType,
+		ProbeCategory:   &probeCat,
+		UiProbeCategory: &probeUICat,
 	}
 	return &ProbeInfoBuilder{
 		probeInfo: probeInfo,
@@ -199,6 +243,12 @@ func (builder *ProbeInfoBuilder) WithActionPolicySet(actionPolicySet []*proto.Ac
 func (builder *ProbeInfoBuilder) WithEntityMetadata(entityMetadataSet []*proto.EntityIdentityMetadata,
 ) *ProbeInfoBuilder {
 	builder.probeInfo.EntityMetadata = entityMetadataSet
+	return builder
+}
+
+func (builder *ProbeInfoBuilder) WithActionMergePolicySet(actionMergePolicySet []*proto.ActionMergePolicyDTO,
+) *ProbeInfoBuilder {
+	builder.probeInfo.ActionMergePolicy = actionMergePolicySet
 	return builder
 }
 

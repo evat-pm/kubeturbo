@@ -33,7 +33,7 @@ type StateMonitoringWorker interface {
 	RetrieveClusterStat() error
 }
 
-func BuildMonitorWorker(source types.MonitoringSource, config MonitorWorkerConfig) (MonitoringWorker, error) {
+func BuildMonitorWorker(source types.MonitoringSource, config MonitorWorkerConfig, isFullDiscovery bool) (MonitoringWorker, error) {
 	// Build monitoring client
 	switch source {
 	case types.KubeletSource:
@@ -41,13 +41,16 @@ func BuildMonitorWorker(source types.MonitoringSource, config MonitorWorkerConfi
 		if !ok {
 			return nil, errors.New("failed to build a Kubelet monitoring client as the provided config was not a KubeletMonitorConfig")
 		}
-		return kubelet.NewKubeletMonitor(kubeletConfig)
+		return kubelet.NewKubeletMonitor(kubeletConfig, isFullDiscovery)
 	case types.ClusterSource:
 		clusterMonitorConfig, ok := config.(*master.ClusterMonitorConfig)
 		if !ok {
 			return nil, errors.New("Failed to build a cluster monitoring client as the provided config was not a ClusterMonitorConfig")
 		}
 		return master.NewClusterMonitor(clusterMonitorConfig)
+	case types.DummySource:
+		dummyMonitorConfig, _ := config.(*DummyMonitorConfig)
+		return NewDummyMonitor(dummyMonitorConfig)
 	default:
 		return nil, fmt.Errorf("Unsupported monitoring source %s", source)
 	}

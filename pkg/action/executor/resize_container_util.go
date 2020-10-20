@@ -2,13 +2,14 @@ package executor
 
 import (
 	"fmt"
-	"k8s.io/client-go/dynamic"
 	"math"
 
 	"github.com/golang/glog"
 
 	"github.com/turbonomic/kubeturbo/pkg/action/util"
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
 	podutil "github.com/turbonomic/kubeturbo/pkg/discovery/util"
+	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
 	k8sapi "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,8 +17,8 @@ import (
 )
 
 // update the Pod.Containers[index]'s Resources.Requests
-func updateReservation(container *k8sapi.Container, patchReservation k8sapi.ResourceList) bool {
-	glog.V(4).Infof("Begin to update Request(Reservation).")
+func updateRequests(container *k8sapi.Container, patchRequests k8sapi.ResourceList) bool {
+	glog.V(4).Infof("Begin to update Request.")
 	changed := false
 
 	//1. get the original requests
@@ -27,7 +28,7 @@ func updateReservation(container *k8sapi.Container, patchReservation k8sapi.Reso
 	}
 
 	//2. apply the patch
-	for k, v := range patchReservation {
+	for k, v := range patchRequests {
 		oldv, exist := result[k]
 		if !exist || oldv.Cmp(v) != 0 {
 			result[k] = v
@@ -44,7 +45,7 @@ func updateReservation(container *k8sapi.Container, patchReservation k8sapi.Reso
 }
 
 // update the Pod.Containers[index]'s Resources.Limits
-func updateCapacity(container *k8sapi.Container, patchCapacity k8sapi.ResourceList) bool {
+func updateLimits(container *k8sapi.Container, patchCapacity k8sapi.ResourceList) bool {
 	glog.V(4).Infof("Begin to update Capacity.")
 	changed := false
 
@@ -73,7 +74,6 @@ func updateCapacity(container *k8sapi.Container, patchCapacity k8sapi.ResourceLi
 }
 
 // make sure that the Request.Value is not bigger than the Limit.Value
-// Note: It is certain that OpsMgr will make sure reservation is less than capacity.
 func checkLimitsRequests(container *k8sapi.Container) error {
 	if container.Resources.Limits == nil || container.Resources.Requests == nil {
 		return nil
@@ -97,32 +97,41 @@ func checkLimitsRequests(container *k8sapi.Container) error {
 	return nil
 }
 
-func updateResourceAmount(podSpec *k8sapi.PodSpec, spec *containerResizeSpec) (bool, error) {
-	//1. get container
-	index := spec.Index
-	if index >= len(podSpec.Containers) {
-		return false, fmt.Errorf("failed to find container[%d] in pod", index)
-	}
-	container := &(podSpec.Containers[index])
-
-	//2. update Limits
+func updateResourceAmount(podSpec *k8sapi.PodSpec, specs []*containerResizeSpec, objectID string) (bool, error) {
 	changed := false
-	if spec.NewCapacity != nil && len(spec.NewCapacity) > 0 {
-		changed = changed || updateCapacity(container, spec.NewCapacity)
-	}
+	for _, spec := range specs {
+		thisSpecChanged := false
+		//1. get container
+		index := spec.Index
+		if index >= len(podSpec.Containers) {
+			glog.Warningf("Skipping container index %d while updating %s.", index, objectID)
+			continue
+		}
+		container := &(podSpec.Containers[index])
 
-	//3. update Requests
-	if spec.NewRequest != nil && len(spec.NewRequest) > 0 {
-		changed = changed || updateReservation(container, spec.NewRequest)
-	}
+		//2. update Limits
+		if spec.NewCapacity != nil && len(spec.NewCapacity) > 0 {
+			thisSpecChanged = thisSpecChanged || updateLimits(container, spec.NewCapacity)
+		}
 
-	//4. check the new Limits vs. Requests, make sure Limits >= Requests
-	if err := checkLimitsRequests(container); err != nil {
-		return false, err
-	}
+		//3. update Requests
+		if spec.NewRequest != nil && len(spec.NewRequest) > 0 {
+			thisSpecChanged = thisSpecChanged || updateRequests(container, spec.NewRequest)
+		}
 
-	if !changed {
-		glog.V(2).Infof("Container %v resources are not changed.", container.Name)
+		//4. check the new Limits vs. Requests, make sure Limits >= Requests
+		if err := checkLimitsRequests(container); err != nil {
+			glog.Warningf("Skipping container index %d while updating %s. Requests are bigger than limits.", index, objectID)
+			continue
+		}
+
+		if thisSpecChanged {
+			glog.V(4).Infof("Container %v resources changed.", container.Name)
+		} else {
+			glog.V(4).Infof("Container %v resources are not changed.", container.Name)
+		}
+
+		changed = changed || thisSpecChanged
 	}
 
 	return changed, nil
@@ -131,10 +140,10 @@ func updateResourceAmount(podSpec *k8sapi.PodSpec, spec *containerResizeSpec) (b
 // Generate a resource.Quantity for CPU.
 // it will convert CPU unit from MHz to CPU.core time in milliSeconds
 // @newValue is from OpsMgr, in MHz
-// @cpuFrequency is from kubeletClient, in KHz
-func genCPUQuantity(newValue float64, cpuFrequency uint64) (resource.Quantity, error) {
-	tmp := newValue * 1000 * 1000 //to KHz and to milliSeconds
-	tmp = tmp / float64(cpuFrequency)
+// @nodeCpuFrequency is from kubeletClient, in MHz
+func genCPUQuantity(newValue float64, nodeCpuFrequency float64) (resource.Quantity, error) {
+	tmp := newValue * 1000 // to milliSeconds
+	tmp = tmp / nodeCpuFrequency
 	cpuTime := int(math.Ceil(tmp))
 	if cpuTime < 1 {
 		cpuTime = 1
@@ -151,12 +160,12 @@ func genMemoryQuantity(newValue float64) (resource.Quantity, error) {
 	return resource.ParseQuantity(fmt.Sprintf("%dKi", tmp))
 }
 
-func resizeContainer(client *kclient.Clientset, dynClient dynamic.Interface, pod *k8sapi.Pod, spec *containerResizeSpec,
-	consistentResize bool) (*k8sapi.Pod, error) {
+func resizeContainer(clusterScraper *cluster.ClusterScraper, pod *k8sapi.Pod, spec *containerResizeSpec, consistentResize bool,
+	ormSpec *resourcemapping.ORMClient) (*k8sapi.Pod, error) {
 	if consistentResize {
-		return nil, resizeControllerContainer(client, dynClient, pod, spec)
+		return nil, resizeControllerContainer(clusterScraper, pod, spec, ormSpec)
 	}
-	return resizeSingleContainer(client, pod, spec)
+	return resizeSingleContainer(clusterScraper.Clientset, pod, spec)
 }
 
 // resizeControllerContainer updates the pod template of the controller that this container pod
@@ -169,9 +178,9 @@ func resizeContainer(client *kclient.Clientset, dynClient dynamic.Interface, pod
 //   resource, all existing pods that belong to the original ReplicaSet and ReplicationController
 //   are not affected. Only newly created pods (through scaling action) will use the updated
 //   resource
-func resizeControllerContainer(client *kclient.Clientset, dynClient dynamic.Interface, pod *k8sapi.Pod, spec *containerResizeSpec) error {
+func resizeControllerContainer(clusterScraper *cluster.ClusterScraper, pod *k8sapi.Pod, spec *containerResizeSpec, ormClient *resourcemapping.ORMClient) error {
 	// prepare controllerUpdater
-	controllerUpdater, err := newK8sControllerUpdater(client, dynClient, pod)
+	controllerUpdater, err := newK8sControllerUpdaterViaPod(clusterScraper, pod, ormClient)
 	if err != nil {
 		glog.Errorf("Failed to create controllerUpdater: %v", err)
 		return err
@@ -179,7 +188,9 @@ func resizeControllerContainer(client *kclient.Clientset, dynClient dynamic.Inte
 	glog.V(2).Infof("Begin to consistently resize %v of pod %s/%s.",
 		controllerUpdater.controller, pod.Namespace, pod.Name)
 	// execute the action to update resource requirements of the container of interest
-	err = controllerUpdater.updateWithRetry(&controllerSpec{0, spec})
+	var specs []*containerResizeSpec
+	specs = append(specs, spec)
+	err = controllerUpdater.updateWithRetry(&controllerSpec{0, specs})
 	if err != nil {
 		glog.Errorf("Failed to consistently resize %v of pod %s/%s: %v",
 			controllerUpdater.controller, pod.Namespace, pod.Name, err)
@@ -197,12 +208,12 @@ func resizeControllerContainer(client *kclient.Clientset, dynClient dynamic.Inte
 func resizeSingleContainer(client *kclient.Clientset, originalPod *k8sapi.Pod, spec *containerResizeSpec) (*k8sapi.Pod, error) {
 	// check parent controller of the original pod
 	fullName := util.BuildIdentifier(originalPod.Namespace, originalPod.Name)
-	parentKind, parentName, err := podutil.GetPodParentInfo(originalPod)
+	parentKind, parentName, _, err := podutil.GetPodParentInfo(originalPod)
 	if err != nil {
 		glog.Errorf("Resize action failed: failed to get pod[%s] parent info: %v.", fullName, err)
 		return nil, err
 	}
-	if !util.SupportedParent(parentKind) {
+	if !util.SupportedParent(parentKind, true) {
 		err = fmt.Errorf("parent kind %v is not supported", parentKind)
 		glog.Errorf("Resize action aborted: %v.", err)
 		return nil, err
@@ -284,11 +295,13 @@ func resizeSingleContainer(client *kclient.Clientset, originalPod *k8sapi.Pod, s
 // clonePodWithNewSize creates a pod with new resource limit/requests
 // return false if there is no need to update resource amount
 func clonePodWithNewSize(client *kclient.Clientset, pod *k8sapi.Pod, spec *containerResizeSpec) (*k8sapi.Pod, bool, error) {
-	id := fmt.Sprintf("%s/%s-%d", pod.Namespace, pod.Name, spec.Index)
+	podName := pod.Name
+	podNamespace := pod.Namespace
+	id := fmt.Sprintf("%s/%s-%d", podNamespace, podName, spec.Index)
 
 	//1. copy pod
 	npod := &k8sapi.Pod{}
-	copyPodWithoutLabel(pod, npod)
+	copyPodWithoutLabel(pod, npod, true)
 	npod.Spec.NodeName = pod.Spec.NodeName
 	npod.Name = genNewPodName(pod)
 	// this annotation can be used for future garbage collection if action is interrupted
@@ -296,7 +309,9 @@ func clonePodWithNewSize(client *kclient.Clientset, pod *k8sapi.Pod, spec *conta
 
 	//2. resize resource limits/requests
 	glog.V(4).Infof("Update container %v resources in the pod specification.", id)
-	changed, err := updateResourceAmount(&npod.Spec, spec)
+	var specs []*containerResizeSpec
+	specs = append(specs, spec)
+	changed, err := updateResourceAmount(&npod.Spec, specs, fmt.Sprintf("%s-%s/%s", "Pod", podNamespace, podName))
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to update capacity for container %s: %v", id, err)
 	}
@@ -305,7 +320,7 @@ func clonePodWithNewSize(client *kclient.Clientset, pod *k8sapi.Pod, spec *conta
 	}
 
 	//3. create pod
-	podClient := client.CoreV1().Pods(pod.Namespace)
+	podClient := client.CoreV1().Pods(podNamespace)
 	rpod, err := podClient.Create(npod)
 	if err != nil {
 		return nil, true, err

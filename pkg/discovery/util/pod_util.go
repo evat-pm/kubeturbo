@@ -6,12 +6,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
+
 	"github.com/golang/glog"
 
 	api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
 	client "k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
@@ -25,6 +25,9 @@ const (
 	Kind_ReplicationController string = "ReplicationController"
 	Kind_ReplicaSet            string = "ReplicaSet"
 	Kind_Job                   string = "Job"
+	// Node owner reference kind is injected by Kubelet if Pod is mirror Pod starting from K8s v1.17
+	// https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/20190916-noderestriction-pods.md#ownerreferences
+	Kind_Node string = "Node"
 
 	// A flag indicating whether the object should be controllable or not.
 	// only value="false" indicating the object should not be controllable by kubeturbo.
@@ -33,10 +36,10 @@ const (
 	TurboControllableAnnotation string = "kubeturbo.io/controllable"
 )
 
-type podEvent struct {
-	eType   string
-	reason  string
-	message string
+type PodEvent struct {
+	EType   string
+	Reason  string
+	Message string
 }
 
 // IsControllableFromAnnotation checks whether a Kubernetes object is controllable or not by its annotation.
@@ -76,6 +79,14 @@ func Controllable(pod *api.Pod) bool {
 	return controllable
 }
 
+// hasController checks if a pod is deployed by K8s controller
+func HasController(pod *api.Pod) bool {
+	if pod.OwnerReferences == nil {
+		return false
+	}
+	return !hasNodeOwner(pod)
+}
+
 // Check if a pod is a mirror pod.
 func isMirrorPod(pod *api.Pod) bool {
 	annotations := pod.Annotations
@@ -86,12 +97,23 @@ func isMirrorPod(pod *api.Pod) bool {
 		glog.V(4).Infof("Find a mirror pod: %s/%s", pod.Namespace, pod.Name)
 		return true
 	}
+	return hasNodeOwner(pod)
+}
+
+// hasNodeOwner checks if a pod has a single owner reference with kind as Node. Node owner reference is injected by Kubelet
+// to identify if a pod is mirror pod starting in K8s v1.17:
+// https://github.com/kubernetes/enhancements/blob/master/keps/sig-auth/20190916-noderestriction-pods.md#ownerreferences
+func hasNodeOwner(pod *api.Pod) bool {
+	if pod.OwnerReferences != nil && len(pod.OwnerReferences) == 1 && pod.OwnerReferences[0].Kind == Kind_Node {
+		glog.V(4).Infof("Find a mirror pod: %s/%s", pod.Namespace, pod.Name)
+		return true
+	}
 	return false
 }
 
 // Check is a pod is created by the given type of entity.
 func isPodCreatedBy(pod *api.Pod, kind string) bool {
-	parentKind, _, err := GetPodParentInfo(pod)
+	parentKind, _, _, err := GetPodParentInfo(pod)
 	if err != nil {
 		glog.Errorf("%++v", err)
 	}
@@ -215,7 +237,7 @@ func ParsePodDisplayName(displayName string) (string, string, error) {
 	return namespace, name, nil
 }
 
-func ParseOwnerReferences(owners []metav1.OwnerReference) (string, string) {
+func ParseOwnerReferences(owners []metav1.OwnerReference) (string, string, string) {
 	for i := range owners {
 		owner := &owners[i]
 
@@ -225,21 +247,20 @@ func ParseOwnerReferences(owners []metav1.OwnerReference) (string, string) {
 		}
 
 		if *(owner.Controller) && len(owner.Kind) > 0 && len(owner.Name) > 0 {
-			return owner.Kind, owner.Name
+			return owner.Kind, owner.Name, string(owner.UID)
 		}
 	}
 
-	return "", ""
+	return "", "", ""
 }
 
-// GetPodParentInfo gets parent information of a pod
-func GetPodParentInfo(pod *api.Pod) (string, string, error) {
+// GetPodParentInfo gets parent information of a pod: kind, name, uid
+func GetPodParentInfo(pod *api.Pod) (string, string, string, error) {
 	//1. check ownerReferences:
-
 	if pod.OwnerReferences != nil && len(pod.OwnerReferences) > 0 {
-		kind, name := ParseOwnerReferences(pod.OwnerReferences)
+		kind, name, uid := ParseOwnerReferences(pod.OwnerReferences)
 		if len(kind) > 0 && len(name) > 0 {
-			return kind, name, nil
+			return kind, name, uid, nil
 		}
 	}
 
@@ -255,55 +276,32 @@ func GetPodParentInfo(pod *api.Pod) (string, string, error) {
 			if err := json.Unmarshal([]byte(value), &ref); err != nil {
 				err = fmt.Errorf("failed to decode parent annoation: %v", err)
 				glog.Errorf("%v\n%v", err, value)
-				return "", "", err
+				return "", "", "", err
 			}
 
-			return ref.Reference.Kind, ref.Reference.Name, nil
+			return ref.Reference.Kind, ref.Reference.Name, string(ref.Reference.UID), nil
 		}
 	}
 
 	glog.V(4).Infof("no parent-info for pod-%v/%v in Annotations.", pod.Namespace, pod.Name)
 
-	return "", "", nil
+	return "", "", "", nil
 }
 
-// GetPodGrandInfo gets grandParent (parent's parent) information of a pod: kind, name
-// If parent does not have parent, then return parent info.
-// Note: if parent kind is "ReplicaSet", then its parent's parent can be a "Deployment"
-func GetPodGrandInfo(dynClient dynamic.Interface, pod *api.Pod) (string, string, error) {
-	//1. get Parent info: kind and name;
-	kind, name, err := GetPodParentInfo(pod)
+// Get controller UID from the given pod and metrics sink.
+func GetControllerUID(pod *api.Pod, metricsSink *metrics.EntityMetricSink) (string, error) {
+	podKey := PodKeyFunc(pod)
+	ownerUIDMetricId := metrics.GenerateEntityStateMetricUID(metrics.PodType, podKey, metrics.OwnerUID)
+	ownerUIDMetric, err := metricsSink.GetMetric(ownerUIDMetricId)
 	if err != nil {
-		return "", "", err
+		return "", fmt.Errorf("error getting owner UID for pod %s --> %v", podKey, err)
 	}
-
-	//2. if parent is "ReplicaSet", check parent's parent
-	if strings.EqualFold(kind, Kind_ReplicaSet) {
-		//2.1 get parent object
-
-		rsRes := schema.GroupVersionResource{
-			Group:    commonutil.K8sAPIReplicasetGV.Group,
-			Version:  commonutil.K8sAPIReplicasetGV.Version,
-			Resource: commonutil.ReplicaSetResName}
-		rs, err := dynClient.Resource(rsRes).Namespace(pod.Namespace).Get(name, metav1.GetOptions{})
-		if err != nil {
-			err = fmt.Errorf("Failed to get ReplicaSet[%v/%v]: %v", pod.Namespace, name, err)
-			glog.Error(err.Error())
-			return "", "", err
-		}
-
-		//2.2 get parent's parent info by parsing ownerReferences:
-		// TODO: The ownerReferences of ReplicaSet is supported only in 1.6.0 and afetr
-		rsOwnerReferences := rs.GetOwnerReferences()
-		if rsOwnerReferences != nil && len(rsOwnerReferences) > 0 {
-			gkind, gname := ParseOwnerReferences(rsOwnerReferences)
-			if len(gkind) > 0 && len(gname) > 0 {
-				return gkind, gname, nil
-			}
-		}
+	ownerUID := ownerUIDMetric.GetValue()
+	controllerUID, ok := ownerUID.(string)
+	if !ok {
+		return "", fmt.Errorf("error getting owner UID for pod %s", podKey)
 	}
-
-	return kind, name, nil
+	return controllerUID, nil
 }
 
 // WaitForPodReady checks the readiness of a given pod with a retry limit and a timeout, whichever
@@ -321,12 +319,12 @@ func WaitForPodReady(client *client.Clientset, namespace, podName, nodeName stri
 	})
 	// log a list of unique events that belong to the pod
 	// warning events are logged in Error level, other events are logged in Info level
-	podEvents := getPodEvents(client, namespace, podName)
+	podEvents := GetPodEvents(client, namespace, podName)
 	for _, pe := range podEvents {
-		if pe.eType == api.EventTypeWarning {
-			glog.Errorf("Pod %s: %s", podName, pe.message)
+		if pe.EType == api.EventTypeWarning {
+			glog.Errorf("Pod %s: %s", podName, pe.Message)
 		} else {
-			glog.V(2).Infof("Pod %s: %s", podName, pe.message)
+			glog.V(2).Infof("Pod %s: %s", podName, pe.Message)
 		}
 	}
 	return err
@@ -402,8 +400,8 @@ func getPodWarnings(pod *api.Pod, podName string) (warnings []string) {
 
 // getPodEvents gets a list of unique events that belong to the given pod
 // These events can be very long, and will only be written to the log file
-func getPodEvents(kubeClient *client.Clientset, namespace, name string) (podEvents []podEvent) {
-	podEvents = []podEvent{}
+func GetPodEvents(kubeClient *client.Clientset, namespace, name string) (podEvents []PodEvent) {
+	podEvents = []PodEvent{}
 	// Get the pod
 	pod, err := kubeClient.CoreV1().Pods(namespace).Get(name, metav1.GetOptions{})
 	if err != nil {
@@ -423,10 +421,10 @@ func getPodEvents(kubeClient *client.Clientset, namespace, name string) (podEven
 			continue
 		}
 		visited[item.Reason] = true
-		podEvents = append(podEvents, podEvent{
-			eType:   item.Type,
-			reason:  item.Reason,
-			message: item.Message,
+		podEvents = append(podEvents, PodEvent{
+			EType:   item.Type,
+			Reason:  item.Reason,
+			Message: item.Message,
 		})
 	}
 	return

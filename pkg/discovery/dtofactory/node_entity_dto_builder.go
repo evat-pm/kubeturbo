@@ -2,6 +2,7 @@ package dtofactory
 
 import (
 	"fmt"
+
 	api "k8s.io/api/core/v1"
 
 	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory/property"
@@ -26,12 +27,13 @@ var (
 		metrics.CPURequest,
 		metrics.MemoryRequest,
 		metrics.NumPods,
+		metrics.VStorage,
 		// TODO, add back provisioned commodity later
 	}
 
 	allocationResourceCommoditiesSold = []metrics.ResourceType{
-		metrics.CPUQuota,
-		metrics.MemoryQuota,
+		metrics.CPULimitQuota,
+		metrics.MemoryLimitQuota,
 		metrics.CPURequestQuota,
 		metrics.MemoryRequestQuota,
 	}
@@ -51,7 +53,6 @@ type nodeEntityDTOBuilder struct {
 }
 
 func NewNodeEntityDTOBuilder(sink *metrics.EntityMetricSink, stitchingManager *stitching.StitchingManager) *nodeEntityDTOBuilder {
-
 	return &nodeEntityDTOBuilder{
 		generalBuilder:   newGeneralBuilder(sink),
 		stitchingManager: stitchingManager,
@@ -118,9 +119,9 @@ func (builder *nodeEntityDTOBuilder) BuildEntityDTOs(nodes []*api.Node) ([]*prot
 		})
 
 		// Action settings for a node
-		// Allow suspend for all nodes except masters
-		isMasterNode := util.DetectMasterRole(node)
-		entityDTOBuilder.IsSuspendable(!isMasterNode)
+		// Allow suspend for all nodes except those marked as HA via kubeturbo config
+		isHANode := util.DetectHARole(node)
+		entityDTOBuilder.IsSuspendable(!isHANode)
 
 		// Power state.
 		// Will be Powered On, only if it is ready and has no issues with kubelet accessibility.
@@ -145,11 +146,7 @@ func (builder *nodeEntityDTOBuilder) BuildEntityDTOs(nodes []*api.Node) ([]*prot
 
 		result = append(result, entityDto)
 
-		if isMasterNode {
-			glog.V(3).Infof("master node dto:\n	 %++v\n", entityDto)
-		} else {
-			glog.V(4).Infof("node dto : %++v\n", entityDto)
-		}
+		glog.V(3).Infof("node dto : %++v\n", entityDto)
 	}
 
 	return result, nil
@@ -233,12 +230,12 @@ func (builder *nodeEntityDTOBuilder) getAllocationCommoditiesSold(node *api.Node
 	if err != nil {
 		return nil, fmt.Errorf("failed to get cpu frequency from sink for node %s: %s", key, err)
 	}
-	// cpuQuota and cpuRequestQuota needs to be converted from number of cores to frequency.
+	// cpuLimitQuota and cpuRequestQuota needs to be converted from number of cores to frequency.
 	converter := NewConverter().Set(
 		func(input float64) float64 {
 			return input * cpuFrequency
 		},
-		metrics.CPUQuota, metrics.CPURequestQuota)
+		metrics.CPULimitQuota, metrics.CPURequestQuota)
 
 	// Resource Commodities
 	var resourceCommoditiesSold []*proto.CommodityDTO
@@ -268,10 +265,8 @@ func (builder *nodeEntityDTOBuilder) getNodeProperties(node *api.Node) ([]*proto
 		*stitchingProperty.Value)
 	properties = append(properties, stitchingProperty)
 
-	// additional node cluster info property.
-	nodeProperty := property.BuildNodeProperties(node)
-	properties = append(properties, nodeProperty)
-
+	// additional node info properties.
+	properties = append(properties, property.BuildNodeProperties(node)...)
 	return properties, nil
 }
 

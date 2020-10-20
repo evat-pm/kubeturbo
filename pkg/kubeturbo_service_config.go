@@ -4,6 +4,7 @@ import (
 	"github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/stitching"
 	kubeletclient "github.com/turbonomic/kubeturbo/pkg/kubeclient"
+	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
 	"k8s.io/client-go/dynamic"
 	kubeclient "k8s.io/client-go/kubernetes"
 )
@@ -23,16 +24,31 @@ type Config struct {
 	DynamicClient dynamic.Interface
 	KubeletClient *kubeletclient.KubeletClient
 	CAClient      *clientset.Clientset
+	// ORMClient builds operator resource mapping templates fetched from OperatorResourceMapping CR in discovery client
+	// and provides the capability to update the corresponding CR for an Operator managed resource in action execution client.
+	ORMClient *resourcemapping.ORMClient
 
 	// Close this to stop all reflectors
 	StopEverything chan struct{}
 
 	DiscoveryIntervalSec int
+	DiscoveryWorkers     int
+	DiscoveryTimeoutSec  int
 	ValidationWorkers    int
 	ValidationTimeoutSec int
 
+	DiscoverySamples           int
+	DiscoverySampleIntervalSec int
+
 	SccSupport    []string
 	CAPINamespace string
+
+	// Strategy to aggregate Container utilization data on ContainerSpec entity
+	containerUtilizationDataAggStrategy string
+	// Strategy to aggregate Container usage data on ContainerSpec entity
+	containerUsageDataAggStrategy string
+
+	failVolumePodMoves bool
 }
 
 func NewVMTConfig2() *Config {
@@ -60,6 +76,11 @@ func (c *Config) WithClusterAPIClient(client *clientset.Clientset) *Config {
 
 func (c *Config) WithKubeletClient(client *kubeletclient.KubeletClient) *Config {
 	c.KubeletClient = client
+	return c
+}
+
+func (c *Config) WithORMClient(client *resourcemapping.ORMClient) *Config {
+	c.ORMClient = client
 	return c
 }
 
@@ -103,6 +124,26 @@ func (c *Config) WithValidationWorkers(di int) *Config {
 	return c
 }
 
+func (c *Config) WithDiscoveryWorkers(workers int) *Config {
+	c.DiscoveryWorkers = workers
+	return c
+}
+
+func (c *Config) WithDiscoveryTimeout(timeout int) *Config {
+	c.DiscoveryTimeoutSec = timeout
+	return c
+}
+
+func (c *Config) WithDiscoverySamples(discoverySamples int) *Config {
+	c.DiscoverySamples = discoverySamples
+	return c
+}
+
+func (c *Config) WithDiscoverySampleIntervalSec(sampleIntervalSec int) *Config {
+	c.DiscoverySampleIntervalSec = sampleIntervalSec
+	return c
+}
+
 func (c *Config) WithSccSupport(sccSupport []string) *Config {
 	c.SccSupport = sccSupport
 	return c
@@ -110,5 +151,20 @@ func (c *Config) WithSccSupport(sccSupport []string) *Config {
 
 func (c *Config) WithCAPINamespace(CAPINamespace string) *Config {
 	c.CAPINamespace = CAPINamespace
+	return c
+}
+
+func (c *Config) WithContainerUtilizationDataAggStrategy(containerUtilizationDataAggStrategy string) *Config {
+	c.containerUtilizationDataAggStrategy = containerUtilizationDataAggStrategy
+	return c
+}
+
+func (c *Config) WithContainerUsageDataAggStrategy(containerUsageDataAggStrategy string) *Config {
+	c.containerUsageDataAggStrategy = containerUsageDataAggStrategy
+	return c
+}
+
+func (c *Config) WithVolumePodMoveConfig(failVolumePodMoves bool) *Config {
+	c.failVolumePodMoves = failVolumePodMoves
 	return c
 }

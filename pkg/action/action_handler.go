@@ -10,9 +10,9 @@ import (
 	"github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset"
 	"github.com/turbonomic/kubeturbo/pkg/action/executor"
 	"github.com/turbonomic/kubeturbo/pkg/action/util"
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
+	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
 	api "k8s.io/api/core/v1"
-	"k8s.io/client-go/dynamic"
-	kubeclient "k8s.io/client-go/kubernetes"
 
 	sdkprobe "github.com/turbonomic/turbo-go-sdk/pkg/probe"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
@@ -38,19 +38,23 @@ var (
 	turboActionContainerResize  = turboActionType{proto.ActionItemDTO_RIGHT_SIZE, proto.EntityDTO_CONTAINER}
 	turboActionMachineProvision = turboActionType{proto.ActionItemDTO_PROVISION, proto.EntityDTO_VIRTUAL_MACHINE}
 	turboActionMachineSuspend   = turboActionType{proto.ActionItemDTO_SUSPEND, proto.EntityDTO_VIRTUAL_MACHINE}
+	turboActionControllerResize = turboActionType{proto.ActionItemDTO_RIGHT_SIZE, proto.EntityDTO_WORKLOAD_CONTROLLER}
 )
 
 type ActionHandlerConfig struct {
-	kubeClient     *kubeclient.Clientset
-	dynamicClient  dynamic.Interface
+	clusterScraper *cluster.ClusterScraper
 	cApiClient     *clientset.Clientset
 	kubeletClient  *kubeletclient.KubeletClient
 	StopEverything chan struct{}
 	sccAllowedSet  map[string]struct{}
 	cAPINamespace  string
+	// ormClient provides the capability to update the corresponding CR for an Operator managed resource.
+	ormClient          *resourcemapping.ORMClient
+	failVolumePodMoves bool
 }
 
-func NewActionHandlerConfig(cApiNamespace string, cApiClient *clientset.Clientset, kubeClient *kubeclient.Clientset, kubeletClient *kubeletclient.KubeletClient, dynamicClient dynamic.Interface, sccSupport []string) *ActionHandlerConfig {
+func NewActionHandlerConfig(cApiNamespace string, cApiClient *clientset.Clientset, kubeletClient *kubeletclient.KubeletClient,
+	clusterScraper *cluster.ClusterScraper, sccSupport []string, ormClient *resourcemapping.ORMClient, failVolumePodMoves bool) *ActionHandlerConfig {
 	sccAllowedSet := make(map[string]struct{})
 	for _, sccAllowed := range sccSupport {
 		sccAllowedSet[strings.TrimSpace(sccAllowed)] = struct{}{}
@@ -58,13 +62,14 @@ func NewActionHandlerConfig(cApiNamespace string, cApiClient *clientset.Clientse
 	glog.V(4).Infof("SCC's allowed: %s", sccAllowedSet)
 
 	config := &ActionHandlerConfig{
-		kubeClient:     kubeClient,
-		dynamicClient:  dynamicClient,
-		kubeletClient:  kubeletClient,
-		StopEverything: make(chan struct{}),
-		sccAllowedSet:  sccAllowedSet,
-		cAPINamespace:  cApiNamespace,
-		cApiClient:     cApiClient,
+		clusterScraper:     clusterScraper,
+		kubeletClient:      kubeletClient,
+		StopEverything:     make(chan struct{}),
+		sccAllowedSet:      sccAllowedSet,
+		cAPINamespace:      cApiNamespace,
+		cApiClient:         cApiClient,
+		ormClient:          ormClient,
+		failVolumePodMoves: failVolumePodMoves,
 	}
 
 	return config
@@ -84,7 +89,7 @@ type ActionHandler struct {
 // Build new ActionHandler and start it.
 func NewActionHandler(config *ActionHandlerConfig) *ActionHandler {
 	lmap := util.NewExpirationMap(defaultActionCacheTTL)
-	podsGetter := config.kubeClient.CoreV1()
+	podsGetter := config.clusterScraper.Clientset.CoreV1()
 	podCachedManager := util.NewPodCachedManager(turbostore.NewTurboCache(defaultPodNameCacheTTL).Cache, podsGetter)
 
 	handler := &ActionHandler{
@@ -103,9 +108,10 @@ func NewActionHandler(config *ActionHandlerConfig) *ActionHandler {
 // As action executor is stateless, they can be safely reused.
 func (h *ActionHandler) registerActionExecutors() {
 	c := h.config
-	ae := executor.NewTurboK8sActionExecutor(c.kubeClient, c.dynamicClient, c.cApiClient, h.podManager)
+	ae := executor.NewTurboK8sActionExecutor(c.clusterScraper, c.cApiClient, h.podManager, h.config.ormClient)
 
-	reScheduler := executor.NewReScheduler(ae, c.sccAllowedSet)
+	reScheduler := executor.NewReScheduler(ae, c.sccAllowedSet, c.failVolumePodMoves)
+
 	h.actionExecutors[turboActionPodMove] = reScheduler
 
 	horizontalScaler := executor.NewHorizontalScaler(ae)
@@ -115,8 +121,11 @@ func (h *ActionHandler) registerActionExecutors() {
 	containerResizer := executor.NewContainerResizer(ae, c.kubeletClient, c.sccAllowedSet)
 	h.actionExecutors[turboActionContainerResize] = containerResizer
 
+	controllerResizer := executor.NewWorkloadControllerResizer(ae, c.kubeletClient, c.sccAllowedSet)
+	h.actionExecutors[turboActionControllerResize] = controllerResizer
+
 	// Only register the actions when API client is non-nil.
-	if ok, err := executor.IsClusterAPIEnabled(c.cAPINamespace, c.cApiClient, c.kubeClient); ok && err == nil {
+	if ok, err := executor.IsClusterAPIEnabled(c.cAPINamespace, c.cApiClient, c.clusterScraper.Clientset); ok && err == nil {
 		machineScaler := executor.NewMachineActionExecutor(c.cAPINamespace, ae)
 		h.actionExecutors[turboActionMachineProvision] = machineScaler
 		h.actionExecutors[turboActionMachineSuspend] = machineScaler
@@ -138,8 +147,6 @@ func (h *ActionHandler) ExecuteAction(actionExecutionDTO *proto.ActionExecutionD
 		return h.failedResult(err.Error()), err
 	}
 
-	actionItemDTO := actionExecutionDTO.GetActionItem()[0]
-
 	// 2. keep sending fake progress to prevent timeout
 	stop := make(chan struct{})
 	defer close(stop)
@@ -147,20 +154,22 @@ func (h *ActionHandler) ExecuteAction(actionExecutionDTO *proto.ActionExecutionD
 
 	// 3. execute the action
 	glog.V(3).Infof("Now wait for action result")
-	err := h.execute(actionItemDTO)
+	err := h.execute(actionExecutionDTO.GetActionItem())
 	if err != nil {
+		glog.Errorf("action execution error %++v", err)
 		return h.failedResult(err.Error()), nil
 	}
 
 	return h.goodResult(), nil
 }
 
-func isPodAction(actionItem *proto.ActionItemDTO) bool {
-	return actionItem.GetTargetSE().GetEntityType() == proto.EntityDTO_CONTAINER_POD ||
-		actionItem.GetTargetSE().GetEntityType() == proto.EntityDTO_CONTAINER
+func isPodRelevantAction(actionItem *proto.ActionItemDTO) bool {
+	entityType := actionItem.GetTargetSE().GetEntityType()
+	return entityType == proto.EntityDTO_CONTAINER_POD ||
+		entityType == proto.EntityDTO_CONTAINER
 }
 
-func (h *ActionHandler) execute(actionItem *proto.ActionItemDTO) error {
+func (h *ActionHandler) execute(actionItems []*proto.ActionItemDTO) error {
 	// Only acquire lock for pod actions so they can be sequentialized
 	// We sequentialize pod actions because there could be different types of actions
 	// generated for the same pod at the same time, e.g., resize and provision
@@ -168,7 +177,11 @@ func (h *ActionHandler) execute(actionItem *proto.ActionItemDTO) error {
 	// the same machine, this is because there will not be resize action for machines,
 	// and we do not want to queue multiple provision/suspend action for the same machine
 	var pod *api.Pod
-	if isPodAction(actionItem) {
+	// This works for all the actions
+	// Actions with multiple action items (WORKLOAD_CONTROLLER) does not get the pod here; it
+	// rather queries the pod again from the apiserver later in this flow.
+	actionItem := actionItems[0]
+	if isPodRelevantAction(actionItem) {
 		// getLock() returns error if it times out (default timeout value is set in lockStore
 		lock, err := h.lockStore.getLock(actionItem)
 		if err != nil {
@@ -189,8 +202,8 @@ func (h *ActionHandler) execute(actionItem *proto.ActionItemDTO) error {
 	}
 
 	input := &executor.TurboActionExecutorInput{
-		ActionItem: actionItem,
-		Pod:        pod,
+		ActionItems: actionItems,
+		Pod:         pod,
 	}
 
 	actionType := getTurboActionType(actionItem)
@@ -208,9 +221,8 @@ func (h *ActionHandler) execute(actionItem *proto.ActionItemDTO) error {
 }
 
 // Finds the pod associated to the action item DTO. The pod, if any, will be used to lock the associated actions.
-// - Pod Move/Provision/Suspend: returns the target SE in the action item
-// - Container Resize: returns the the hostedBy SE in the action item
-// - Machine Provision/Suspend: returns nil
+// - Pod Move/Provision/Suspend: uses the target SE in the action item
+// - Container Resize: uses the hostedBy SE in the action item
 func (h *ActionHandler) getRelatedPod(actionItem *proto.ActionItemDTO) (*api.Pod, error) {
 	var podEntity *proto.EntityDTO
 	actionType := getTurboActionType(actionItem)

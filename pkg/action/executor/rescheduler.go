@@ -14,19 +14,21 @@ import (
 
 type ReScheduler struct {
 	TurboK8sActionExecutor
-	sccAllowedSet map[string]struct{}
+	sccAllowedSet      map[string]struct{}
+	failVolumePodMoves bool
 }
 
-func NewReScheduler(ae TurboK8sActionExecutor, sccAllowedSet map[string]struct{}) *ReScheduler {
+func NewReScheduler(ae TurboK8sActionExecutor, sccAllowedSet map[string]struct{}, failVolumePodMoves bool) *ReScheduler {
 	return &ReScheduler{
 		TurboK8sActionExecutor: ae,
 		sccAllowedSet:          sccAllowedSet,
+		failVolumePodMoves:     failVolumePodMoves,
 	}
 }
 
 // Execute executes the move action. The error message will be shown in UI.
 func (r *ReScheduler) Execute(input *TurboActionExecutorInput) (*TurboActionExecutorOutput, error) {
-	actionItem := input.ActionItem
+	actionItem := input.ActionItems[0]
 	pod := input.Pod
 
 	//1. get target Pod and new hosting Node
@@ -69,21 +71,21 @@ func (r *ReScheduler) getNode(action *proto.ActionItemDTO) (*api.Node, error) {
 	}
 
 	//3. get node from properties
-	node, err := util.GetNodeFromProperties(r.kubeClient, hostSE.GetEntityProperties())
+	node, err := util.GetNodeFromProperties(r.clusterScraper.Clientset, hostSE.GetEntityProperties())
 	if err == nil {
 		glog.V(2).Infof("Get node(%v) from properties.", node.Name)
 		return node, nil
 	}
 
 	//4. get node by displayName
-	node, err = util.GetNodebyName(r.kubeClient, hostSE.GetDisplayName())
+	node, err = util.GetNodebyName(r.clusterScraper.Clientset, hostSE.GetDisplayName())
 	if err == nil {
 		glog.V(2).Infof("Get node(%v) by displayName.", node.Name)
 		return node, nil
 	}
 
 	//5. get node by UUID
-	node, err = util.GetNodebyUUID(r.kubeClient, hostSE.GetId())
+	node, err = util.GetNodebyUUID(r.clusterScraper.Clientset, hostSE.GetId())
 	if err == nil {
 		glog.V(2).Infof("Get node(%v) by UUID(%v).", node.Name, hostSE.GetId())
 		return node, nil
@@ -92,15 +94,15 @@ func (r *ReScheduler) getNode(action *proto.ActionItemDTO) (*api.Node, error) {
 	//6. get node by IP
 	vmIPs := getVMIps(hostSE)
 	if len(vmIPs) > 0 {
-		node, err = util.GetNodebyIP(r.kubeClient, vmIPs)
+		node, err = util.GetNodebyIP(r.clusterScraper.Clientset, vmIPs)
 		if err == nil {
 			glog.V(2).Infof("Get node(%v) by IP.", hostSE.GetDisplayName())
 			return node, nil
 		}
-		err = fmt.Errorf("Failed to get node %s by IP %+v: %v",
+		err = fmt.Errorf("failed to get node %s by IP %+v: %v",
 			hostSE.GetDisplayName(), vmIPs, err)
 	} else {
-		err = fmt.Errorf("Failed to get node %s: IPs are empty",
+		err = fmt.Errorf("failed to get node %s: IPs are empty",
 			hostSE.GetDisplayName())
 	}
 	glog.Errorf("%v.", err)
@@ -151,7 +153,6 @@ func (r *ReScheduler) preActionCheck(pod *api.Pod, node *api.Node) error {
 func (r *ReScheduler) reSchedule(pod *api.Pod, node *api.Node) (*api.Pod, error) {
 	//1. do some check
 	if err := r.preActionCheck(pod, node); err != nil {
-		glog.Errorf("Move action aborted: %v.", err)
 		return nil, err
 	}
 
@@ -159,26 +160,21 @@ func (r *ReScheduler) reSchedule(pod *api.Pod, node *api.Node) (*api.Pod, error)
 	fullName := util.BuildIdentifier(pod.Namespace, pod.Name)
 	// if the pod is already on the target node, then simply return success.
 	if pod.Spec.NodeName == nodeName {
-		err := fmt.Errorf("Pod [%v] is already on host [%v]", fullName, nodeName)
-		glog.V(2).Infof("Move action aborted: %v.", err)
-		return nil, err
+		return nil, fmt.Errorf("Pod [%v] is already on host [%v]", fullName, nodeName)
 	}
 
-	parentKind, parentName, err := podutil.GetPodParentInfo(pod)
+	parentKind, parentName, _, err := podutil.GetPodParentInfo(pod)
 	if err != nil {
-		err = fmt.Errorf("Cannot get parent info of pod [%v]: %v", fullName, err)
-		glog.Errorf("Move action aborted: %v.", err)
-		return nil, err
+		return nil, fmt.Errorf("Cannot get parent info of pod [%v]: %v", fullName, err)
 	}
 
-	if !util.SupportedParent(parentKind) {
-		err = fmt.Errorf("The object kind [%v] of [%s] is not supported", parentKind, parentName)
-		glog.Errorf("Move action aborted: %v.", err)
-		return nil, err
+	if !util.SupportedParent(parentKind, false) {
+		return nil, fmt.Errorf("The object kind [%v] of [%s] is not supported", parentKind, parentName)
 	}
 
 	//2. move
-	return movePod(r.kubeClient, pod, nodeName, defaultRetryMore)
+	return movePod(r.clusterScraper, pod, nodeName, parentKind,
+		parentName, defaultRetryMore, r.failVolumePodMoves)
 }
 
 func getVMIps(entity *proto.EntityDTO) []string {

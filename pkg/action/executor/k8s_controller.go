@@ -3,6 +3,8 @@ package executor
 import (
 	"fmt"
 
+	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
+
 	apicorev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -25,14 +27,16 @@ type k8sController interface {
 // - podSpec: The pod template of a controller to update for consistent resize
 // Note: Use pointer for in-place update
 type k8sControllerSpec struct {
-	replicas *int32
-	podSpec  *apicorev1.PodSpec
+	replicas       *int32
+	podSpec        *apicorev1.PodSpec
+	controllerName string
 }
 
 type parentController struct {
 	dynNamespacedClient dynamic.ResourceInterface
 	obj                 *unstructured.Unstructured
 	name                string
+	ormClient           *resourcemapping.ORMClient
 }
 
 func (c *parentController) get(name string) (*k8sControllerSpec, error) {
@@ -61,8 +65,9 @@ func (c *parentController) get(name string) (*k8sControllerSpec, error) {
 	c.obj = obj
 	int32Replicas := int32(replicas)
 	return &k8sControllerSpec{
-		replicas: &int32Replicas,
-		podSpec:  &podSpec,
+		replicas:       &int32Replicas,
+		podSpec:        &podSpec,
+		controllerName: fmt.Sprintf("%s-%s", kind, objName),
 	}, nil
 }
 
@@ -76,14 +81,23 @@ func (c *parentController) update(updatedSpec *k8sControllerSpec) error {
 		return fmt.Errorf("error converting pod spec to unstructured pod spec for %s %s: %v", kind, objName, err)
 	}
 
+	origControllerObj := c.obj.DeepCopy()
 	if err := unstructured.SetNestedField(c.obj.Object, replicaVal, "spec", "replicas"); err != nil {
 		return fmt.Errorf("error setting replicas into unstructured %s %s: %v", kind, objName, err)
 	}
 	if err := unstructured.SetNestedField(c.obj.Object, podSpecUnstructured, "spec", "template", "spec"); err != nil {
 		return fmt.Errorf("error setting podSpec into unstructured %s %s: %v", kind, objName, err)
 	}
-
-	_, err = c.dynNamespacedClient.Update(c.obj, metav1.UpdateOptions{})
+	controllerOwnerReferences := c.obj.GetOwnerReferences()
+	if controllerOwnerReferences != nil && len(controllerOwnerReferences) == 1 && *controllerOwnerReferences[0].Controller {
+		// If k8s controller is controlled by custom controller, update the CR using OperatorResourceMapping
+		if c.ormClient == nil {
+			return fmt.Errorf("failed to execute action with nil ORMClient")
+		}
+		err = c.ormClient.Update(origControllerObj, c.obj, controllerOwnerReferences[0])
+	} else {
+		_, err = c.dynNamespacedClient.Update(c.obj, metav1.UpdateOptions{})
+	}
 	return err
 }
 

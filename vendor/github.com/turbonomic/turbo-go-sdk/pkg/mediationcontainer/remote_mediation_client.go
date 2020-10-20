@@ -1,6 +1,7 @@
 package mediationcontainer
 
 import (
+	"sync"
 	"time"
 
 	"github.com/turbonomic/turbo-go-sdk/pkg/probe"
@@ -25,8 +26,10 @@ type remoteMediationClient struct {
 	probeResponseChan chan *proto.MediationClientMessage
 	// Channel to stop the mediation client and the underlying transport and message handling
 	stopMediationClientCh chan struct{}
-	//  Channel to stop the routine that monitors the underlying transport connection
+	// Channel to stop the routine that monitors the underlying transport connection
 	closeWatcherCh chan bool
+	// Make sure to stop only once to avoid panic
+	stopOnce sync.Once
 }
 
 func CreateRemoteMediationClient(allProbes map[string]*ProbeProperties,
@@ -52,7 +55,7 @@ func CreateRemoteMediationClient(allProbes map[string]*ProbeProperties,
 
 // Establish connection with the Turbo server -  Blocks till WebSocket connection is open
 // Complete the probe registration protocol with the server and then wait for server messages
-func (remoteMediationClient *remoteMediationClient) Init(probeRegisteredMsgCh chan bool) {
+func (remoteMediationClient *remoteMediationClient) Init(probeRegisteredMsgCh chan bool, disconnectFromTurbo chan struct{}) {
 	// TODO: Assert that the probes are registered before starting the handshake ??
 
 	//// --------- Create WebSocket Transport
@@ -78,8 +81,7 @@ func (remoteMediationClient *remoteMediationClient) Init(probeRegisteredMsgCh ch
 	// handle WebSocket creation errors
 	if err != nil { //transport.ws == nil {
 		glog.Errorf("Initialization of remote mediation client failed, null transport")
-		remoteMediationClient.Stop()
-		probeRegisteredMsgCh <- false
+		close(disconnectFromTurbo)
 		return
 	}
 
@@ -96,9 +98,8 @@ func (remoteMediationClient *remoteMediationClient) Init(probeRegisteredMsgCh ch
 
 	glog.V(4).Infof("Sdk client protocol completed with status %v", status)
 	if !status {
-		glog.Errorf("Registration with server failed")
-		probeRegisteredMsgCh <- status
-		remoteMediationClient.Stop()
+		glog.Errorf("Registration with server failed with status %v", status)
+		close(disconnectFromTurbo)
 		return
 	}
 
@@ -154,22 +155,24 @@ func (remoteMediationClient *remoteMediationClient) Init(probeRegisteredMsgCh ch
 	select {
 	case <-remoteMediationClient.stopMediationClientCh:
 		glog.V(4).Infof("[Init] Exit routine *************")
+		close(disconnectFromTurbo)
 		return
 	}
 }
 
 // Stop the remote mediation client by closing the underlying transport and message handler routines
 func (remoteMediationClient *remoteMediationClient) Stop() {
-	// First stop the transport connection monitor
-	close(remoteMediationClient.closeWatcherCh)
-	// Stop the server message listener
-	remoteMediationClient.stopMessageHandler()
-	// Close the transport
-	if remoteMediationClient.Transport != nil {
-		remoteMediationClient.Transport.CloseTransportPoint()
-	}
-	// Notify the client to stop
-	close(remoteMediationClient.stopMediationClientCh)
+	remoteMediationClient.stopOnce.Do(func() {
+		// First stop the transport connection monitor
+		close(remoteMediationClient.closeWatcherCh)
+		// Note: Do NOT close stopMsgHandlerCh and stopListenerCh, as they may have been closed already
+		// Close the transport
+		if remoteMediationClient.Transport != nil {
+			remoteMediationClient.Transport.CloseTransportPoint()
+		}
+		// Notify the client to stop, this will in turn disconnect from Turbo
+		close(remoteMediationClient.stopMediationClientCh)
+	})
 }
 
 // ======================== Listen for server messages ===================

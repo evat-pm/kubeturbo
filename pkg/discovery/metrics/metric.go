@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"github.com/golang/glog"
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -9,13 +10,15 @@ type DiscoveredEntityType string
 type ResourceType string
 
 const (
-	ClusterType     DiscoveredEntityType = "Cluster"
-	QuotaType       DiscoveredEntityType = "Quota"
+	ClusterType     DiscoveredEntityType = "VMCluster"
+	NamespaceType   DiscoveredEntityType = "Namespace"
 	NodeType        DiscoveredEntityType = "Node"
+	ControllerType  DiscoveredEntityType = "Controller"
 	PodType         DiscoveredEntityType = "Pod"
 	ContainerType   DiscoveredEntityType = "Container"
 	ApplicationType DiscoveredEntityType = "Application"
 	ServiceType     DiscoveredEntityType = "Service"
+	VolumeType      DiscoveredEntityType = "Volume"
 )
 
 const (
@@ -23,20 +26,23 @@ const (
 	Memory             ResourceType = "Memory"
 	CPURequest         ResourceType = "CPURequest"
 	MemoryRequest      ResourceType = "MemoryRequest"
-	CPUQuota           ResourceType = "CPUQuota"
-	MemoryQuota        ResourceType = "MemoryQuota"
+	CPULimitQuota      ResourceType = "CPULimitQuota"
+	MemoryLimitQuota   ResourceType = "MemoryLimitQuota"
 	CPURequestQuota    ResourceType = "CPURequestQuota"
 	MemoryRequestQuota ResourceType = "MemoryRequestQuota"
 	CPUProvisioned     ResourceType = "CPUProvisioned"
 	MemoryProvisioned  ResourceType = "MemoryProvisioned"
 	Transaction        ResourceType = "Transaction"
 	NumPods            ResourceType = "NumPods"
+	VStorage           ResourceType = "VStorage"
+	StorageAmount      ResourceType = "StorageAmount"
 
 	Access       ResourceType = "Access"
 	Cluster      ResourceType = "Cluster"
 	CpuFrequency ResourceType = "CpuFrequency"
 	Owner        ResourceType = "Owner"
 	OwnerType    ResourceType = "OwnerType"
+	OwnerUID     ResourceType = "OwnerUID"
 )
 
 var (
@@ -47,31 +53,49 @@ var (
 	}
 
 	// Mapping of Kubernetes API Server resource names to the allocation resource types
+	// A resource quota definition, although undocumented, honours both "cpu" and "requests.cpu"
+	// as keys for cpu request quota and likewise for memory.
+	// This has more to do with legacy support, where when the resourcequota proposal was introduced
+	// had support only for "cpu" and "memory" corresponding to limiting only requests.
 	KubeQuotaResourceTypes = map[v1.ResourceName]ResourceType{
-		v1.ResourceLimitsCPU:      CPUQuota,
-		v1.ResourceLimitsMemory:   MemoryQuota,
+		v1.ResourceCPU:            CPURequestQuota,
+		v1.ResourceMemory:         MemoryRequestQuota,
+		v1.ResourceLimitsCPU:      CPULimitQuota,
+		v1.ResourceLimitsMemory:   MemoryLimitQuota,
 		v1.ResourceRequestsCPU:    CPURequestQuota,
 		v1.ResourceRequestsMemory: MemoryRequestQuota,
 	}
 
-	// Mapping of allocation to compute resources
+	// Mapping of quota to compute resources
 	QuotaToComputeMap = map[ResourceType]ResourceType{
-		CPUQuota:           CPU,
-		MemoryQuota:        Memory,
+		CPULimitQuota:      CPU,
+		MemoryLimitQuota:   Memory,
 		CPURequestQuota:    CPURequest,
 		MemoryRequestQuota: MemoryRequest,
+	}
+
+	// Set of resource limit quota types
+	QuotaLimitTypes = map[ResourceType]struct{}{
+		CPULimitQuota:    {},
+		MemoryLimitQuota: {},
+	}
+
+	// Set of resource request quota types
+	QuotaRequestTypes = map[ResourceType]struct{}{
+		CPURequestQuota:    {},
+		MemoryRequestQuota: {},
 	}
 
 	// List of Compute resources
 	ComputeResources []ResourceType
 
-	// List of Allocation resources
+	// List of Quota resources
 	QuotaResources []ResourceType
 
 	// List of cpu related metrics
 	CPUResources map[ResourceType]bool
 
-	// Mapping of compute to allocation resources
+	// Mapping of compute to quota resources
 	ComputeToQuotaMap map[ResourceType]ResourceType
 )
 
@@ -86,9 +110,9 @@ func init() {
 	}
 	// Compute QuotaResources from the KubeQuotaResourceTypes map
 	for name, resource := range KubeQuotaResourceTypes {
-		QuotaResources = append(QuotaResources, resource)
-		if name == v1.ResourceLimitsCPU || name == v1.ResourceRequestsCPU {
-			cpuResources = append(cpuResources, resource)
+		QuotaResources = appendUnique(QuotaResources, resource)
+		if name == v1.ResourceCPU || name == v1.ResourceLimitsCPU || name == v1.ResourceRequestsCPU {
+			cpuResources = appendUnique(cpuResources, resource)
 		}
 	}
 	// Compute CPUResources
@@ -101,6 +125,17 @@ func init() {
 	for k, v := range QuotaToComputeMap {
 		ComputeToQuotaMap[v] = k
 	}
+}
+
+func appendUnique(resourceTypes []ResourceType, resourceType ResourceType) []ResourceType {
+	for _, rt := range resourceTypes {
+		if rt == resourceType {
+			// This type is already in the slice, don't add
+			return resourceTypes
+		}
+	}
+
+	return append(resourceTypes, resourceType)
 }
 
 // Returns true if the given resource type argument belongs to the list of allocation resources
@@ -129,9 +164,8 @@ func IsCPUType(resourceType ResourceType) bool {
 type MetricProp string
 
 const (
-	Capacity    MetricProp = "Capacity"
-	Used        MetricProp = "Used"
-	Reservation MetricProp = "Reservation"
+	Capacity MetricProp = "Capacity"
+	Used     MetricProp = "Used"
 )
 
 type Metric interface {
@@ -139,6 +173,14 @@ type Metric interface {
 	GetMetricProp() MetricProp
 	GetUID() string
 	GetValue() interface{}
+	UpdateValue(existing interface{}, maxMetricPointsSize int) Metric
+}
+
+type MetricValue struct {
+	// Average of all data points
+	Avg float64
+	// Peak of all data points
+	Peak float64
 }
 
 type MetricFilterFunc func(m Metric) bool
@@ -146,10 +188,18 @@ type MetricFilterFunc func(m Metric) bool
 type ResourceMetric struct {
 	resourceType ResourceType
 	metricProp   MetricProp
-	value        float64
+	value        interface{}
 }
 
-func NewResourceMetric(rType ResourceType, mProp MetricProp, v float64) ResourceMetric {
+// Data point of a resource metric sample collected from kubelet
+type Point struct {
+	// Resource metric value
+	Value float64
+	// Time at which the metric value is collected
+	Timestamp int64
+}
+
+func NewResourceMetric(rType ResourceType, mProp MetricProp, v interface{}) ResourceMetric {
 	return ResourceMetric{
 		resourceType: rType,
 		metricProp:   mProp,
@@ -157,21 +207,26 @@ func NewResourceMetric(rType ResourceType, mProp MetricProp, v float64) Resource
 	}
 }
 
-type EntityResourceMetric struct {
+type EntityDetails struct {
 	metricUID string
 
 	entityType DiscoveredEntityType
 	entityID   string
+}
 
+type EntityResourceMetric struct {
+	EntityDetails
 	ResourceMetric
 }
 
 func NewEntityResourceMetric(eType DiscoveredEntityType, id string, rType ResourceType, mProp MetricProp,
-	v float64) EntityResourceMetric {
+	v interface{}) EntityResourceMetric {
 	return EntityResourceMetric{
-		metricUID:      GenerateEntityResourceMetricUID(eType, id, rType, mProp),
-		entityType:     eType,
-		entityID:       id,
+		EntityDetails: EntityDetails{
+			metricUID:  GenerateEntityResourceMetricUID(eType, id, rType, mProp),
+			entityType: eType,
+			entityID:   id,
+		},
 		ResourceMetric: NewResourceMetric(rType, mProp, v),
 	}
 }
@@ -192,16 +247,38 @@ func (m EntityResourceMetric) GetValue() interface{} {
 	return m.value
 }
 
+func (m EntityResourceMetric) UpdateValue(existing interface{}, maxMetricPointsSize int) Metric {
+	typedExisting, isRightType := existing.(EntityResourceMetric)
+	if !isRightType {
+		glog.Warning("Skipping metrics value update as metrics type mismatches from cache.")
+		return m
+	}
+
+	newPoints, isMultiPoint := m.value.([]Point)
+	if !isMultiPoint {
+		m.value = typedExisting.value
+		return m
+	}
+
+	// The caller should ensure that right type is created and matching
+	// type updated for multi point metrics, else this will CRASH.
+	points := typedExisting.value.([]Point)
+	points = append(points, newPoints...)
+	// If points length is larger than maxMetricPointsSize, use latest maxMetricPointsSize of points
+	if len(points) > maxMetricPointsSize {
+		points = points[len(points)-maxMetricPointsSize:]
+	}
+	m.value = points
+	return m
+}
+
 // Generate the UID for each metric entry based on entityType, entityID, resourceType and metricType.
 func GenerateEntityResourceMetricUID(eType DiscoveredEntityType, id string, rType ResourceType, mType MetricProp) string {
 	return string(eType) + "-" + id + "-" + string(rType) + "-" + string(mType)
 }
 
 type EntityStateMetric struct {
-	metricUID string
-
-	entityType DiscoveredEntityType
-	entityID   string
+	EntityDetails
 
 	resourceType ResourceType
 	value        interface{}
@@ -216,9 +293,11 @@ type StateMetric struct {
 
 func NewEntityStateMetric(eType DiscoveredEntityType, id string, rType ResourceType, v interface{}) EntityStateMetric {
 	return EntityStateMetric{
-		metricUID:    GenerateEntityStateMetricUID(eType, id, rType),
-		entityType:   eType,
-		entityID:     id,
+		EntityDetails: EntityDetails{
+			metricUID:  GenerateEntityStateMetricUID(eType, id, rType),
+			entityType: eType,
+			entityID:   id,
+		},
 		resourceType: rType,
 		value:        v,
 	}
@@ -238,6 +317,11 @@ func (m EntityStateMetric) GetUID() string {
 
 func (m EntityStateMetric) GetValue() interface{} {
 	return m.value
+}
+
+func (m EntityStateMetric) UpdateValue(existing interface{}, maxMetricPointsSize int) Metric {
+	// NOP
+	return nil
 }
 
 // Generate the UID for each metric entry based on entityType, entityID and resourceType.

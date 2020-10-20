@@ -3,15 +3,15 @@ package executor
 import (
 	"github.com/openshift/cluster-api/pkg/client/clientset_generated/clientset"
 	"github.com/turbonomic/kubeturbo/pkg/action/util"
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
+	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 	api "k8s.io/api/core/v1"
-	"k8s.io/client-go/dynamic"
-	kclient "k8s.io/client-go/kubernetes"
 )
 
 type TurboActionExecutorInput struct {
-	ActionItem *proto.ActionItemDTO
-	Pod        *api.Pod
+	ActionItems []*proto.ActionItemDTO
+	Pod         *api.Pod
 }
 
 type TurboActionExecutorOutput struct {
@@ -25,17 +25,18 @@ type TurboActionExecutor interface {
 }
 
 type TurboK8sActionExecutor struct {
-	kubeClient    *kclient.Clientset
-	dynamicClient dynamic.Interface
-	cApiClient    *clientset.Clientset
-	podManager    util.IPodManager
+	clusterScraper *cluster.ClusterScraper
+	cApiClient     *clientset.Clientset
+	podManager     util.IPodManager
+	ormClient      *resourcemapping.ORMClient
 }
 
-func NewTurboK8sActionExecutor(kubeClient *kclient.Clientset, dynamicClient dynamic.Interface, cApiClient *clientset.Clientset, podManager util.IPodManager) TurboK8sActionExecutor {
+func NewTurboK8sActionExecutor(clusterScraper *cluster.ClusterScraper, cApiClient *clientset.Clientset,
+	podManager util.IPodManager, ormSpec *resourcemapping.ORMClient) TurboK8sActionExecutor {
 	return TurboK8sActionExecutor{
-		kubeClient:    kubeClient,
-		dynamicClient: dynamicClient,
-		cApiClient:    cApiClient,
-		podManager:    podManager,
+		clusterScraper: clusterScraper,
+		cApiClient:     cApiClient,
+		podManager:     podManager,
+		ormClient:      ormSpec,
 	}
 }

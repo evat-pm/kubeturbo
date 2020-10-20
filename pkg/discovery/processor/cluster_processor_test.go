@@ -2,17 +2,18 @@ package processor
 
 import (
 	"fmt"
+	"testing"
+	"time"
+
 	cadvisorapi "github.com/google/cadvisor/info/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	stats "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
-	"testing"
-	"time"
 )
 
 var (
@@ -216,13 +217,9 @@ func TestConnectCluster(t *testing.T) {
 	}
 
 	ns := &MockNodeScrapper{
-		mockGetMachineCpuFrequency: func(host string) (uint64, error) {
-			for _, mockNode := range mockNodes {
-				if mockNode.ipAddress == host {
-					return mockNode.cpuFreq, nil
-				}
-			}
-			return 0, nil
+		mockGetSummary: func(ip, nodeName string) (*stats.Summary, error) {
+			summary := stats.Summary{}
+			return &summary, nil
 		},
 	}
 	clusterProcessor := &ClusterProcessor{
@@ -247,10 +244,11 @@ func TestConnectClusterUnreachableNodes(t *testing.T) {
 	}
 
 	ns := &MockNodeScrapper{
-		mockGetMachineCpuFrequency: func(host string) (uint64, error) {
-			return 0, fmt.Errorf("%s node is unreachable", host)
+		mockGetSummary: func(ip, nodeName string) (*stats.Summary, error) {
+			return nil, fmt.Errorf("%s node is unreachable", ip)
 		},
 	}
+
 	clusterProcessor := &ClusterProcessor{
 		clusterInfoScraper: ms,
 		nodeScrapper:       ns,
@@ -271,17 +269,13 @@ func TestConnectClusterReachableAndUnreachableNodes(t *testing.T) {
 		},
 	}
 
-	reachableNodes := []string{"10.10.10.1", "10.10.10.2"}
 	ns := &MockNodeScrapper{
-		mockGetMachineCpuFrequency: func(host string) (uint64, error) {
-			for _, nodeIp := range reachableNodes {
-				if nodeIp == host {
-					return 6400000, nil
-				}
-			}
-			return 0, fmt.Errorf("%s node is unreachable", host)
+		mockGetSummary: func(ip, nodeName string) (*stats.Summary, error) {
+			summary := stats.Summary{}
+			return &summary, nil
 		},
 	}
+
 	clusterProcessor := &ClusterProcessor{
 		clusterInfoScraper: ms,
 		nodeScrapper:       ns,
@@ -302,6 +296,8 @@ type MockClusterScrapper struct {
 	mockGetAllEndpoints        func() ([]*v1.Endpoints, error)
 	mockGetAllServices         func() ([]*v1.Service, error)
 	mockGetKubernetesServiceID func() (svcID string, err error)
+	mockGetAllPVs              func() ([]*v1.PersistentVolume, error)
+	mockGetAllPVCs             func() ([]*v1.PersistentVolumeClaim, error)
 }
 
 func (s *MockClusterScrapper) GetAllNodes() ([]*v1.Node, error) {
@@ -349,6 +345,7 @@ func (s *MockClusterScrapper) GetKubernetesServiceID() (string, error) {
 	}
 	return "", fmt.Errorf("GetKubernetesServiceID Not implemented")
 }
+
 func (s *MockClusterScrapper) GetAllServices() ([]*v1.Service, error) {
 	if s.mockGetAllServices != nil {
 		return s.mockGetAllServices()
@@ -356,39 +353,53 @@ func (s *MockClusterScrapper) GetAllServices() ([]*v1.Service, error) {
 	return nil, fmt.Errorf("GetAllServices Not implemented")
 }
 
+func (s *MockClusterScrapper) GetAllPVs() ([]*v1.PersistentVolume, error) {
+	if s.mockGetAllPVs != nil {
+		return s.mockGetAllPVs()
+	}
+	return nil, fmt.Errorf("GetAllPVs Not implemented")
+}
+
+func (s *MockClusterScrapper) GetAllPVCs() ([]*v1.PersistentVolumeClaim, error) {
+	if s.mockGetAllPVCs != nil {
+		return s.mockGetAllPVCs()
+	}
+	return nil, fmt.Errorf("GetAllPVCs Not implemented")
+}
+
 // Implements the KubeHttpClientInterface
 // Method implementation will check to see if the test has provided the mockXXX method function
 type MockNodeScrapper struct {
-	mockExecuteRequestAndGetValue func(host string, endpoint string, value interface{}) error
-	mockGetSummary                func(host string) (*stats.Summary, error)
-	mockGetMachineInfo            func(host string) (*cadvisorapi.MachineInfo, error)
-	mockGetMachineCpuFrequency    func(host string) (uint64, error)
+	mockExecuteRequestAndGetValue func(ip, nodeName, path string, value interface{}) error
+	mockGetSummary                func(ip, nodeName string) (*stats.Summary, error)
+	mockGetMachineInfo            func(ip, nodeName string) (*cadvisorapi.MachineInfo, error)
+	mockGetNodeCpuFrequency       func(node *v1.Node) (float64, error)
 }
 
-func (s *MockNodeScrapper) ExecuteRequestAndGetValue(host string, endpoint string, value interface{}) error {
+func (s *MockNodeScrapper) ExecuteRequestAndGetValue(ip, nodeName, path string, value interface{}) error {
 	if s.mockExecuteRequestAndGetValue != nil {
-		return s.mockExecuteRequestAndGetValue(host, endpoint, value)
+		return s.mockExecuteRequestAndGetValue(ip, "", path, value)
 	}
 	return fmt.Errorf("ExecuteRequestAndGetValue Not implemented")
 }
 
-func (s *MockNodeScrapper) GetSummary(host string) (*stats.Summary, error) {
+func (s *MockNodeScrapper) GetSummary(ip, nodeName string) (*stats.Summary, error) {
 	if s.mockGetSummary != nil {
-		return s.mockGetSummary(host)
+		return s.mockGetSummary(ip, nodeName)
 	}
 	return nil, fmt.Errorf("GetSummary Not implemented")
 }
 
-func (s *MockNodeScrapper) GetMachineInfo(host string) (*cadvisorapi.MachineInfo, error) {
+func (s *MockNodeScrapper) GetMachineInfo(ip, nodeName string) (*cadvisorapi.MachineInfo, error) {
 	if s.mockGetMachineInfo != nil {
-		return s.mockGetMachineInfo(host)
+		return s.mockGetMachineInfo(ip, nodeName)
 	}
 	return nil, fmt.Errorf("GetMachineInfo Not implemented")
 }
 
-func (s *MockNodeScrapper) GetMachineCpuFrequency(host string) (uint64, error) {
-	if s.mockGetMachineCpuFrequency != nil {
-		return s.mockGetMachineCpuFrequency(host)
+func (s *MockNodeScrapper) GetNodeCpuFrequency(node *v1.Node) (float64, error) {
+	if s.mockGetNodeCpuFrequency != nil {
+		return s.mockGetNodeCpuFrequency(node)
 	}
-	return 0, fmt.Errorf("GetMachineCpuFrequency Not implemented")
+	return 0, fmt.Errorf("GetNodeCpuFrequency Not implemented")
 }

@@ -3,7 +3,6 @@ package master
 import (
 	"errors"
 	"fmt"
-	"k8s.io/client-go/dynamic"
 
 	api "k8s.io/api/core/v1"
 
@@ -37,6 +36,7 @@ type ClusterMonitor struct {
 type PodOwner struct {
 	kind string
 	name string
+	uid  string
 }
 
 func NewClusterMonitor(config *ClusterMonitorConfig) (*ClusterMonitor, error) {
@@ -79,7 +79,7 @@ func (m *ClusterMonitor) RetrieveClusterStat() error {
 	defer close(m.stopCh)
 
 	if m.nodeList == nil {
-		return errors.New("Invalid nodeList or empty nodeList. Nothing to monitor")
+		return errors.New("invalid nodeList or empty nodeList. Nothing to monitor")
 	}
 	select {
 	case <-m.stopCh:
@@ -87,7 +87,7 @@ func (m *ClusterMonitor) RetrieveClusterStat() error {
 	default:
 		err := m.findClusterID()
 		if err != nil {
-			return fmt.Errorf("Failed to find cluster ID based on Kubernetes service: %v", err)
+			return fmt.Errorf("failed to find cluster ID based on Kubernetes service: %v", err)
 		}
 		select {
 		case <-m.stopCh:
@@ -117,6 +117,7 @@ func (m *ClusterMonitor) findClusterID() error {
 	// TODO use a constant for cluster commodity key.
 	clusterInfo := metrics.NewEntityStateMetric(metrics.ClusterType, "", metrics.Cluster, kubernetesSvcID)
 	m.sink.AddNewMetricEntries(clusterInfo)
+	glog.V(3).Infof("Successfully added cluster info metrics for cluster %v", kubernetesSvcID)
 	return nil
 }
 
@@ -134,7 +135,7 @@ func (m *ClusterMonitor) findNodeStates() {
 		// node labels
 		labelMetrics := parseNodeLabels(node)
 		m.sink.AddNewMetricEntries(labelMetrics)
-
+		glog.V(3).Infof("Successfully generated label metrics for node %s", key)
 		// owner labels - TODO:
 
 	}
@@ -146,7 +147,7 @@ func (m *ClusterMonitor) findNodeStates() {
 //	CPURequest      capacity, used
 //	MemoryRequest   capacity, used
 func (m *ClusterMonitor) genNodeResourceMetrics(node *api.Node, key string) {
-	glog.V(4).Infof("Now get resouce metrics for node %s", key)
+	glog.V(3).Infof("Now get resource metrics for node %s", key)
 
 	//1. Capacity of CPU and Memory
 	//1.1 Get the total resource of a node
@@ -166,7 +167,8 @@ func (m *ClusterMonitor) genNodeResourceMetrics(node *api.Node, key string) {
 
 	//3. Generate metrics for hosted Pods and containers
 	//The return value of this method is the totalCPURequest and totalMemRequest used on the node
-	nodeCPURequestUsed, nodeMemRequestUsed, currentPods := m.genNodePodsMetrics(node, cpuCapacityCore, memoryCapacityKiloBytes)
+	nodeCPURequestUsed, nodeMemRequestUsed, currentPods := m.genNodePodsMetrics(node, cpuCapacityCore, memoryCapacityKiloBytes,
+		cpuRequestCapacityCore, memoryRequestCapacityKiloBytes)
 
 	//4. Generate the numconsumers (current pod number and actual allocatable pods) metrics for the given node
 	allocatablePods := util.GetNumPodsAllocatable(node)
@@ -177,6 +179,7 @@ func (m *ClusterMonitor) genNodeResourceMetrics(node *api.Node, key string) {
 	m.genRequestUsedMetrics(metrics.NodeType, key, nodeCPURequestUsed, nodeMemRequestUsed)
 	glog.V(4).Infof("CPURequest used of node %s is %f core", node.Name, nodeCPURequestUsed)
 	glog.V(4).Infof("MemoryRequest used of node %s is %f Kb", node.Name, nodeMemRequestUsed)
+	glog.V(3).Infof("Successfully generated resource metrics for node %s", key)
 }
 
 // Parse the labels of a node and create one EntityStateMetric
@@ -198,7 +201,8 @@ func parseNodeLabels(node *api.Node) metrics.EntityStateMetric {
 // ----------------------------------------------- Pod State -------------------------------------------------
 // generate all the metrics for the hosted Pods of this node.
 // Resource metrics such as capacity and usage
-func (m *ClusterMonitor) genNodePodsMetrics(node *api.Node, cpuCapacity, memCapacity float64) (nodeCPURequestUsedCore float64, nodeMemoryRequestUsedKiloBytes float64, numPods float64) {
+func (m *ClusterMonitor) genNodePodsMetrics(node *api.Node, cpuCapacity, memCapacity, cpuRequestCapacity,
+	memoryRequestCapacity float64) (nodeCPURequestUsedCore float64, nodeMemoryRequestUsedKiloBytes float64, numPods float64) {
 	// Get the pod list for the node
 	podList, exist := m.nodePodMap[node.Name]
 	if !exist || len(podList) < 1 {
@@ -210,42 +214,44 @@ func (m *ClusterMonitor) genNodePodsMetrics(node *api.Node, cpuCapacity, memCapa
 	for _, pod := range podList {
 		key := util.PodKeyFunc(pod)
 		// Pod owners
-		podOwner, err := m.getPodOwner(pod, m.clusterClient.DynamicClient)
+		podOwner, err := m.getPodOwner(pod)
 		if err == nil {
 			m.podOwners[key] = podOwner
 		}
 
 		// Pod capacity metrics and Container resources metric
-		podCPURequest, podMemoryRequest := m.genPodMetrics(pod, cpuCapacity, memCapacity)
+		podCPURequest, podMemoryRequest := m.genPodMetrics(pod, cpuCapacity, memCapacity, cpuRequestCapacity, memoryRequestCapacity)
 		nodeCPURequestUsedCore += podCPURequest
 		nodeMemoryRequestUsedKiloBytes += podMemoryRequest
 	}
 
 	numPods = float64(len(podList))
+	glog.V(3).Infof("Successfully generated pod metrics for node %v.", node.Name)
 	return
 }
 
-func (m *ClusterMonitor) getPodOwner(pod *api.Pod, dynClient dynamic.Interface) (*PodOwner, error) {
+func (m *ClusterMonitor) getPodOwner(pod *api.Pod) (*PodOwner, error) {
 	key := util.PodKeyFunc(pod)
 	glog.V(4).Infof("begin to generate pod[%s]'s Owner metric.", key)
 
-	kind, parentName, err := util.GetPodGrandInfo(dynClient, pod)
+	kind, parentName, uid, _, _, err := m.clusterClient.GetPodGrandparentInfo(pod, false)
 	if err != nil {
-		return nil, fmt.Errorf("Error getting pod owner: %v", err)
+		return nil, fmt.Errorf("error getting pod owner: %v", err)
 	}
 
-	if parentName == "" || kind == "" {
-		return nil, fmt.Errorf("Invalid pod owner %s::%s", kind, parentName)
+	if parentName == "" || kind == "" || uid == "" {
+		return nil, fmt.Errorf("invalid pod owner %s::%s::%s", kind, parentName, uid)
 	}
-	return &PodOwner{kind: kind, name: parentName}, nil
+	return &PodOwner{kind: kind, name: parentName, uid: uid}, nil
 }
 
-// genPodMetrics: based on hosting Node's cpuCapacity and memCapacity
-// (1) generate Pod.Capacity and Pod.Reservation
-// (2) generate Container.Capacity and Container.Reservation
-//
-// Note: Pod.Capacity = node.Capacity; Pod.Reservation = sum.container.reservation
-func (m *ClusterMonitor) genPodMetrics(pod *api.Pod, nodeCPUCapacity, nodeMemCapacity float64) (float64, float64) {
+// genPodMetrics: based on hosting Node's cpuCapacity, memCapacity, cpuAllocatable and memAllocatable
+// (1) generate Container CPU/Memory capacity, CPURequest/MemoryRequest capacity and CPU/memory limit and request quota used
+// (resource quota used is the same as corresponding resource capacity)
+// (2) generate Pod CPU/Memory capacity and CPURequest/MemoryRequest capacity
+// (3) Pod CPURequest/MemoryRequest usage is the sum of containers CPURequest/MemoryRequest capacity
+func (m *ClusterMonitor) genPodMetrics(pod *api.Pod, nodeCPUCapacity, nodeMemCapacity, nodeCPUAllocatable,
+	nodeMemAllocatable float64) (float64, float64) {
 	key := util.PodKeyFunc(pod)
 	glog.V(4).Infof("begin to generate pod[%s]'s CPU/Mem Capacity.", key)
 
@@ -255,18 +261,18 @@ func (m *ClusterMonitor) genPodMetrics(pod *api.Pod, nodeCPUCapacity, nodeMemCap
 	podMId := util.PodMetricIdAPI(pod)
 	m.genCapacityMetrics(metrics.PodType, podMId, cpuCapacity, memCapacity)
 
-	//2. Reservation
+	//2. Requests
 	//2.1 Get the totalCPURequest and totalMemRequest from all containers in the pod
 	podCPURequest, podMemRequest := m.genContainerMetrics(pod, cpuCapacity, memCapacity)
-	//2.2 Generate reservation metric for CPU and Mem
-	m.genReservationMetrics(metrics.PodType, podMId, podCPURequest, podMemRequest)
+	//2.2 Generate capacity metric for CPURequest and MemRequest. Pod requests capacity is node Allocatable
+	m.genRequestCapacityMetrics(metrics.PodType, podMId, nodeCPUAllocatable, nodeMemAllocatable)
 	//2.3 Generate used metric for CPURequest and MemRequest
 	m.genRequestUsedMetrics(metrics.PodType, podMId, podCPURequest, podMemRequest)
 
 	//3. Owner
 	podOwner, exists := m.podOwners[key]
 	if exists && podOwner != nil {
-		m.genOwnerMetrics(metrics.PodType, key, podOwner.kind, podOwner.name)
+		m.genOwnerMetrics(metrics.PodType, key, podOwner.kind, podOwner.name, podOwner.uid)
 	}
 
 	return podCPURequest, podMemRequest
@@ -285,7 +291,7 @@ func (m *ClusterMonitor) genContainerMetrics(pod *api.Pod, podCPU, podMem float6
 		container := &(pod.Spec.Containers[i])
 		containerMId := util.ContainerMetricId(podMId, container.Name)
 
-		//1. capacity
+		//1. CPU, Memory, CPULimitQuota and MemoryLimitQuota capacity
 		limits := container.Resources.Limits
 		cpuLimit := limits.Cpu().MilliValue()
 		memLimit := limits.Memory().Value()
@@ -293,19 +299,23 @@ func (m *ClusterMonitor) genContainerMetrics(pod *api.Pod, podCPU, podMem float6
 		memCapacity := podMem
 
 		if cpuLimit > 1 {
-			cpuCapacity = float64(cpuLimit) / util.MilliToUnit
+			cpuCapacity = util.MetricMilliToUnit(float64(cpuLimit))
 		}
 
 		if memLimit > 1 {
-			memCapacity = float64(memLimit) / util.KilobytesToBytes
+			memCapacity = util.Base2BytesToKilobytes(float64(memLimit))
 		}
 		m.genCapacityMetrics(metrics.ContainerType, containerMId, cpuCapacity, memCapacity)
+		// Generate resource limit quota metrics with used value as CPU/memory resource capacity
+		m.genLimitQuotaUsedMetrics(metrics.ContainerType, containerMId, cpuCapacity, memCapacity)
 
-		//2. reservation
+		//2. CPURequest, MemoryRequest, CPURequestQuota and MemoryRequestQuota capacity
 		requests := container.Resources.Requests
-		cpuRequest := float64(requests.Cpu().MilliValue()) / util.MilliToUnit
-		memRequest := float64(requests.Memory().Value()) / util.KilobytesToBytes
-		m.genReservationMetrics(metrics.ContainerType, containerMId, cpuRequest, memRequest)
+		cpuRequest := util.MetricMilliToUnit(float64(requests.Cpu().MilliValue()))
+		memRequest := util.Base2BytesToKilobytes(float64(requests.Memory().Value()))
+		m.genRequestCapacityMetrics(metrics.ContainerType, containerMId, cpuRequest, memRequest)
+		// Generate resource request quota metrics with used value as CPU/memory resource request capacity
+		m.genRequestQuotaUsedMetrics(metrics.ContainerType, containerMId, cpuRequest, memRequest)
 
 		totalCPURequest += cpuRequest
 		totalMemRequest += memRequest
@@ -313,19 +323,21 @@ func (m *ClusterMonitor) genContainerMetrics(pod *api.Pod, podCPU, podMem float6
 		//3. Owner
 		podOwner, exists := m.podOwners[podKey]
 		if exists && podOwner != nil {
-			m.genOwnerMetrics(metrics.ContainerType, containerMId, podOwner.kind, podOwner.name)
+			m.genOwnerMetrics(metrics.ContainerType, containerMId, podOwner.kind, podOwner.name, podOwner.uid)
 		}
 	}
 
 	return totalCPURequest, totalMemRequest
 }
 
-func (m *ClusterMonitor) genOwnerMetrics(etype metrics.DiscoveredEntityType, key string, kind, parentName string) {
-	if parentName != "" && kind != "" {
+func (m *ClusterMonitor) genOwnerMetrics(etype metrics.DiscoveredEntityType, key, kind, parentName, uid string) {
+	if parentName != "" && kind != "" && uid != "" {
 		ownerMetric := metrics.NewEntityStateMetric(etype, key, metrics.Owner, parentName)
 		ownerTypeMetric := metrics.NewEntityStateMetric(etype, key, metrics.OwnerType, kind)
+		ownerUIDMetric := metrics.NewEntityStateMetric(etype, key, metrics.OwnerUID, uid)
 		m.sink.AddNewMetricEntries(ownerMetric)
 		m.sink.AddNewMetricEntries(ownerTypeMetric)
+		m.sink.AddNewMetricEntries(ownerUIDMetric)
 	}
 }
 
@@ -350,10 +362,17 @@ func (m *ClusterMonitor) genCapacityMetrics(etype metrics.DiscoveredEntityType, 
 	m.sink.AddNewMetricEntries(cpuMetric, memMetric)
 }
 
-// genReservationMetrics generates reservation (equivalent of request) metrics for VCPU and VMemory commodity
-func (m *ClusterMonitor) genReservationMetrics(etype metrics.DiscoveredEntityType, key string, cpu, memory float64) {
-	cpuMetric := metrics.NewEntityResourceMetric(etype, key, metrics.CPU, metrics.Reservation, cpu)
-	memMetric := metrics.NewEntityResourceMetric(etype, key, metrics.Memory, metrics.Reservation, memory)
+// genLimitQuotaUsedMetrics generates used metrics for CPULimitQuota and MemoryLimitQuota resources
+func (m *ClusterMonitor) genLimitQuotaUsedMetrics(etype metrics.DiscoveredEntityType, key string, cpu, memory float64) {
+	cpuMetric := metrics.NewEntityResourceMetric(etype, key, metrics.CPULimitQuota, metrics.Used, cpu)
+	memMetric := metrics.NewEntityResourceMetric(etype, key, metrics.MemoryLimitQuota, metrics.Used, memory)
+	m.sink.AddNewMetricEntries(cpuMetric, memMetric)
+}
+
+// genRequestQuotaUsedMetrics generates used metrics for CPURequestQuota and MemoryRequestQuota resources
+func (m *ClusterMonitor) genRequestQuotaUsedMetrics(etype metrics.DiscoveredEntityType, key string, cpu, memory float64) {
+	cpuMetric := metrics.NewEntityResourceMetric(etype, key, metrics.CPURequestQuota, metrics.Used, cpu)
+	memMetric := metrics.NewEntityResourceMetric(etype, key, metrics.MemoryRequestQuota, metrics.Used, memory)
 	m.sink.AddNewMetricEntries(cpuMetric, memMetric)
 }
 

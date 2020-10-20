@@ -39,7 +39,7 @@ func NewAffinityProcessor(config *affinityProcessorConfig) (*AffinityProcessor, 
 	if err != nil {
 		return nil, err
 	}
-	allPods, err := config.k8sClusterScraper.GetAllPods()
+	allPods, err := config.k8sClusterScraper.GetAllRunningAndReadyPods()
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func (am *AffinityProcessor) processAffinityPerPod(pod *api.Pod, podsNodesMap ma
 	}
 
 	podAffinityTerms := getAllPodAffinityTerms(affinity)
-	podAffinityCommodityDTOsSold, podAffinityCommodityDTOsBought, err := am.commManager.GetAccessCommoditiesForPodAffinityAntiAffinity(podAffinityTerms)
+	podAffinityCommodityDTOsSold, podAffinityCommodityDTOsBought, err := am.commManager.GetAccessCommoditiesForPodAffinityAntiAffinity(podAffinityTerms, pod)
 	if err != nil {
 		glog.Errorf("Failed to build commodity for pod affinity: %s", err)
 		return

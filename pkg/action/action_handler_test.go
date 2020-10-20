@@ -5,6 +5,7 @@ import (
 
 	"github.com/turbonomic/kubeturbo/pkg/action/executor"
 	"github.com/turbonomic/kubeturbo/pkg/action/util"
+	"github.com/turbonomic/kubeturbo/pkg/cluster"
 	"github.com/turbonomic/kubeturbo/pkg/kubeclient"
 	"github.com/turbonomic/kubeturbo/pkg/turbostore"
 	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
@@ -14,7 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	client "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/typed/core/v1"
+	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
 )
 
@@ -30,8 +31,8 @@ func TestActionHandler_registerActionExecutors(t *testing.T) {
 
 	h.registerActionExecutors()
 
-	supportedActions := [...]turboActionType{turboActionPodProvision, turboActionPodMove, turboActionContainerResize,
-		turboActionPodSuspend}
+	supportedActions := [...]turboActionType{turboActionPodProvision, turboActionPodMove,
+		turboActionContainerResize, turboActionPodSuspend, turboActionControllerResize}
 	m := h.actionExecutors
 	if len(m) != len(supportedActions) {
 		t.Errorf("Action handler supports %d action types but got %d", len(supportedActions), len(m))
@@ -111,7 +112,7 @@ func newActionHandlerConfig() *ActionHandlerConfig {
 	config := &ActionHandlerConfig{}
 
 	config.StopEverything = make(chan struct{})
-	config.kubeClient = &client.Clientset{}
+	config.clusterScraper = cluster.NewClusterScraper(&client.Clientset{}, nil)
 	config.kubeletClient = &kubeclient.KubeletClient{}
 
 	return config

@@ -73,7 +73,7 @@ func (builder *applicationEntityDTOBuilder) BuildEntityDTO(pod *api.Pod) ([]*pro
 
 		displayName := util.ApplicationDisplayName(podFullName, container.Name)
 
-		ebuilder := sdkbuilder.NewEntityDTOBuilder(proto.EntityDTO_APPLICATION, appId).
+		ebuilder := sdkbuilder.NewEntityDTOBuilder(proto.EntityDTO_APPLICATION_COMPONENT, appId).
 			DisplayName(displayName)
 
 		//2. sold commodities: transaction and responseTime
@@ -137,7 +137,8 @@ func (builder *applicationEntityDTOBuilder) getCommoditiesSold(pod *api.Pod, ind
 	// Service is associated with the pod, then the commodities key is the service Id,
 	// Else, it is computed using the container IP
 	if svc != nil {
-		key = util.GetServiceClusterID(svc)
+		// Use svc UID as key to be universally unique across different clusters
+		key = string(svc.UID)
 	} else {
 		key = pod.Status.PodIP
 	}

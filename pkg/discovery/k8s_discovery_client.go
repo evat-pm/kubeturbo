@@ -2,73 +2,135 @@ package discovery
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/worker"
-	"github.com/turbonomic/kubeturbo/pkg/discovery/worker/compliance"
-	"github.com/turbonomic/kubeturbo/pkg/registration"
-
-	sdkprobe "github.com/turbonomic/turbo-go-sdk/pkg/probe"
-	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 
 	"github.com/golang/glog"
 	"github.com/turbonomic/kubeturbo/pkg/cluster"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/configs"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/dtofactory"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/processor"
 	"github.com/turbonomic/kubeturbo/pkg/discovery/repository"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/worker"
+	"github.com/turbonomic/kubeturbo/pkg/discovery/worker/compliance"
+	"github.com/turbonomic/kubeturbo/pkg/registration"
+	"github.com/turbonomic/kubeturbo/pkg/resourcemapping"
+	sdkprobe "github.com/turbonomic/turbo-go-sdk/pkg/probe"
+	"github.com/turbonomic/turbo-go-sdk/pkg/proto"
 )
 
 const (
-	// TODO make this number programmatically.
-	workerCount int = 4
+	minDiscoveryWorker = 1
+	maxDiscoveryWorker = 10
+	// Max number of data samples to be collected for each resource metric
+	maxDataSamples = 60
+	// Min sampling discovery interval
+	minSampleIntervalSec = 10
 )
 
 type DiscoveryClientConfig struct {
-	probeConfig          *configs.ProbeConfig
-	targetConfig         *configs.K8sTargetConfig
-	ValidationWorkers    int
-	ValidationTimeoutSec int
+	probeConfig                *configs.ProbeConfig
+	targetConfig               *configs.K8sTargetConfig
+	ValidationWorkers          int
+	ValidationTimeoutSec       int
+	DiscoveryWorkers           int
+	DiscoveryTimeoutSec        int
+	DiscoverySamples           int
+	DiscoverySampleIntervalSec int
+	// Strategy to aggregate Container utilization data on ContainerSpec entity
+	containerUtilizationDataAggStrategy string
+	// Strategy to aggregate Container usage data on ContainerSpec entity
+	containerUsageDataAggStrategy string
+	// ORMClient builds operator resource mapping templates fetched from OperatorResourceMapping CR so that action
+	// execution client will be able to execute action on operator-managed resources based on resource mapping templates.
+	ormClient *resourcemapping.ORMClient
 }
 
 func NewDiscoveryConfig(probeConfig *configs.ProbeConfig,
 	targetConfig *configs.K8sTargetConfig, ValidationWorkers int,
-	ValidationTimeoutSec int) *DiscoveryClientConfig {
+	ValidationTimeoutSec int, containerUtilizationDataAggStrategy,
+	containerUsageDataAggStrategy string, ormClient *resourcemapping.ORMClient,
+	discoveryWorkers, discoveryTimeoutMin, discoverySamples, discoverySampleIntervalSec int) *DiscoveryClientConfig {
+	if discoveryWorkers < minDiscoveryWorker {
+		glog.Warningf("Invalid number of discovery workers %v, set it to %v.",
+			discoveryWorkers, minDiscoveryWorker)
+		discoveryWorkers = minDiscoveryWorker
+	} else if discoveryWorkers > maxDiscoveryWorker {
+		glog.Warningf("Discovery workers %v is higher than %v, set it to %v.", discoveryWorkers,
+			maxDiscoveryWorker, maxDiscoveryWorker)
+		discoveryWorkers = maxDiscoveryWorker
+	} else {
+		glog.Infof("Number of discovery workers: %v.", discoveryWorkers)
+	}
+	if discoverySamples > maxDataSamples {
+		glog.Warningf("Number of discovery samples %v is higher than %v, set it to %v.", discoverySamples,
+			maxDataSamples, maxDataSamples)
+		discoverySamples = maxDataSamples
+	}
+	if discoverySampleIntervalSec < minSampleIntervalSec {
+		glog.Warningf("Sampling discovery interval %v seconds is lower than %v seconds, set it to %v seconds.", discoverySampleIntervalSec,
+			minSampleIntervalSec, minSampleIntervalSec)
+		discoverySampleIntervalSec = minSampleIntervalSec
+	}
 	return &DiscoveryClientConfig{
-		probeConfig:          probeConfig,
-		targetConfig:         targetConfig,
-		ValidationWorkers:    ValidationWorkers,
-		ValidationTimeoutSec: ValidationTimeoutSec,
+		probeConfig:                         probeConfig,
+		targetConfig:                        targetConfig,
+		ValidationWorkers:                   ValidationWorkers,
+		ValidationTimeoutSec:                ValidationTimeoutSec,
+		containerUtilizationDataAggStrategy: containerUtilizationDataAggStrategy,
+		containerUsageDataAggStrategy:       containerUsageDataAggStrategy,
+		ormClient:                           ormClient,
+		DiscoveryWorkers:                    discoveryWorkers,
+		DiscoveryTimeoutSec:                 discoveryTimeoutMin,
+		DiscoverySamples:                    discoverySamples,
+		DiscoverySampleIntervalSec:          discoverySampleIntervalSec,
 	}
 }
 
 // Implements the go sdk discovery client interface
 type K8sDiscoveryClient struct {
-	config            *DiscoveryClientConfig
-	k8sClusterScraper *cluster.ClusterScraper
-
-	clusterProcessor *processor.ClusterProcessor
-	dispatcher       *worker.Dispatcher
-	resultCollector  *worker.ResultCollector
+	config                 *DiscoveryClientConfig
+	k8sClusterScraper      *cluster.ClusterScraper
+	clusterProcessor       *processor.ClusterProcessor
+	dispatcher             *worker.Dispatcher
+	samplingDispatcher     *worker.SamplingDispatcher
+	resultCollector        *worker.ResultCollector
+	globalEntityMetricSink *metrics.EntityMetricSink
 }
 
 func NewK8sDiscoveryClient(config *DiscoveryClientConfig) *K8sDiscoveryClient {
-	k8sClusterScraper := cluster.NewClusterScraper(config.probeConfig.ClusterClient, config.probeConfig.DynamicClient)
+	k8sClusterScraper := config.probeConfig.ClusterScraper
 
 	// for discovery tasks
-	clusterProcessor := processor.NewClusterProcessor(k8sClusterScraper, config.probeConfig.NodeClient, config.ValidationWorkers, config.ValidationTimeoutSec)
-	// make maxWorkerCount of result collector twice the worker count.
-	resultCollector := worker.NewResultCollector(workerCount * 2)
+	clusterProcessor := processor.NewClusterProcessor(k8sClusterScraper, config.probeConfig.NodeClient,
+		config.ValidationWorkers, config.ValidationTimeoutSec)
 
-	dispatcherConfig := worker.NewDispatcherConfig(k8sClusterScraper, config.probeConfig, workerCount)
-	dispatcher := worker.NewDispatcher(dispatcherConfig)
+	globalEntityMetricSink := metrics.NewEntityMetricSink().WithMaxMetricPointsSize(config.DiscoverySamples)
+
+	// make maxWorkerCount of result collector twice the worker count.
+	resultCollector := worker.NewResultCollector(config.DiscoveryWorkers * 2)
+
+	dispatcherConfig := worker.NewDispatcherConfig(k8sClusterScraper, config.probeConfig,
+		config.DiscoveryWorkers, config.DiscoveryTimeoutSec, config.DiscoverySamples, config.DiscoverySampleIntervalSec)
+	dispatcher := worker.NewDispatcher(dispatcherConfig, globalEntityMetricSink)
 	dispatcher.Init(resultCollector)
 
+	// Create new SamplingDispatcher to assign tasks to collect additional resource usage data samples from kubelet
+	samplingDispatcherConfig := worker.NewDispatcherConfig(k8sClusterScraper, config.probeConfig,
+		config.DiscoveryWorkers, config.DiscoverySampleIntervalSec, config.DiscoverySamples, config.DiscoverySampleIntervalSec)
+	dataSamplingDispatcher := worker.NewSamplingDispatcher(samplingDispatcherConfig, globalEntityMetricSink)
+	dataSamplingDispatcher.InitSamplingDiscoveryWorkers()
+
 	dc := &K8sDiscoveryClient{
-		config:            config,
-		k8sClusterScraper: k8sClusterScraper,
-		clusterProcessor:  clusterProcessor,
-		dispatcher:        dispatcher,
-		resultCollector:   resultCollector,
+		config:                 config,
+		k8sClusterScraper:      k8sClusterScraper,
+		clusterProcessor:       clusterProcessor,
+		dispatcher:             dispatcher,
+		samplingDispatcher:     dataSamplingDispatcher,
+		resultCollector:        resultCollector,
+		globalEntityMetricSink: globalEntityMetricSink,
 	}
 	return dc
 }
@@ -84,19 +146,37 @@ func (dc *K8sDiscoveryClient) GetAccountValues() *sdkprobe.TurboTargetInfo {
 	}
 	accountValues = append(accountValues, accVal)
 
-	username := registration.Username
-	accVal = &proto.AccountValue{
-		Key:         &username,
-		StringValue: &targetConf.TargetUsername,
-	}
-	accountValues = append(accountValues, accVal)
+	// Only add the following fields when target has been configured in kubeturbo
+	if targetConf.TargetIdentifier != "" {
+		masterHost := registration.MasterHost
+		accVal = &proto.AccountValue{
+			Key:         &masterHost,
+			StringValue: &targetConf.MasterHost,
+		}
+		accountValues = append(accountValues, accVal)
 
-	password := registration.Password
-	accVal = &proto.AccountValue{
-		Key:         &password,
-		StringValue: &targetConf.TargetPassword,
+		serverVersion := registration.ServerVersion
+		version := strings.Join(targetConf.ServerVersions, ", ")
+		accVal = &proto.AccountValue{
+			Key:         &serverVersion,
+			StringValue: &version,
+		}
+		accountValues = append(accountValues, accVal)
+
+		image := registration.Image
+		accVal = &proto.AccountValue{
+			Key:         &image,
+			StringValue: &targetConf.ProbeContainerImage,
+		}
+		accountValues = append(accountValues, accVal)
+
+		imageID := registration.ImageID
+		accVal = &proto.AccountValue{
+			Key:         &imageID,
+			StringValue: &targetConf.ProbeContainerImageID,
+		}
+		accountValues = append(accountValues, accVal)
 	}
-	accountValues = append(accountValues, accVal)
 
 	targetInfo := sdkprobe.NewTurboTargetInfoBuilder(targetConf.ProbeCategory,
 		targetConf.TargetType, targetID, accountValues).
@@ -105,46 +185,81 @@ func (dc *K8sDiscoveryClient) GetAccountValues() *sdkprobe.TurboTargetInfo {
 }
 
 // Validate the Target
-func (dc *K8sDiscoveryClient) Validate(accountValues []*proto.AccountValue) (*proto.ValidationResponse, error) {
+func (dc *K8sDiscoveryClient) Validate(
+	accountValues []*proto.AccountValue) (validationResponse *proto.ValidationResponse, err error) {
+
 	glog.V(2).Infof("Validating Kubernetes target...")
 
-	validationResponse := &proto.ValidationResponse{}
+	defer func() {
+		validationResponse = &proto.ValidationResponse{}
+		if err != nil {
+			glog.Errorf("Failed to validate target: %v.", err)
+			errStr := fmt.Sprintf("%s\n", err)
+			severity := proto.ErrorDTO_CRITICAL
+			var errorDtos []*proto.ErrorDTO
+			errorDto := &proto.ErrorDTO{
+				Severity:    &severity,
+				Description: &errStr,
+			}
+			errorDtos = append(errorDtos, errorDto)
+			validationResponse.ErrorDTO = errorDtos
+		} else {
+			glog.V(2).Infof("Successfully validated target.")
+		}
+	}()
 
-	var err error
+	var targetID string
+	for _, accountValue := range accountValues {
+		glog.V(4).Infof("%v", accountValue)
+		if accountValue.GetKey() == registration.TargetIdentifierField {
+			targetID = accountValue.GetStringValue()
+		}
+	}
+
+	if targetID == "" {
+		err = fmt.Errorf("empty target ID")
+		return
+	}
+
 	if dc.clusterProcessor == nil {
 		err = fmt.Errorf("null cluster processor")
-	} else {
-		err = dc.clusterProcessor.ConnectCluster()
-	}
-	if err != nil {
-		glog.Errorf("Failed to validate target: %v.", err)
-		errStr := fmt.Sprintf("%s\n", err)
-		severity := proto.ErrorDTO_CRITICAL
-		var errorDtos []*proto.ErrorDTO
-		errorDto := &proto.ErrorDTO{
-			Severity:    &severity,
-			Description: &errStr,
-		}
-		errorDtos = append(errorDtos, errorDto)
-		validationResponse.ErrorDTO = errorDtos
-	} else {
-		glog.V(2).Infof("Successfully validated target.")
+		return
 	}
 
-	return validationResponse, nil
+	err = dc.clusterProcessor.ConnectCluster()
+	return
 }
 
 // DiscoverTopology receives a discovery request from server and start probing the k8s.
 // This is a part of the interface that gets registered with and is invoked asynchronously by the GO SDK Probe.
-func (dc *K8sDiscoveryClient) Discover(accountValues []*proto.AccountValue) (*proto.DiscoveryResponse, error) {
+func (dc *K8sDiscoveryClient) Discover(
+	accountValues []*proto.AccountValue) (discoveryResponse *proto.DiscoveryResponse, err error) {
+
 	glog.V(2).Infof("Discovering kubernetes cluster...")
-	currentTime := time.Now()
-	newDiscoveryResultDTOs, groupDTOs, err := dc.discoverWithNewFramework()
-	if err != nil {
-		glog.Errorf("Failed to discover kubernetes cluster: %v", err)
+
+	discoveryResponse = &proto.DiscoveryResponse{}
+
+	var targetID string
+	for _, accountValue := range accountValues {
+		glog.V(4).Infof("%v", accountValue)
+		if accountValue.GetKey() == registration.TargetIdentifierField {
+			targetID = accountValue.GetStringValue()
+		}
 	}
 
-	discoveryResponse := &proto.DiscoveryResponse{
+	if targetID == "" {
+		glog.Errorf("Failed to discover kubernetes cluster: empty target ID")
+		return
+	}
+
+	currentTime := time.Now()
+	newDiscoveryResultDTOs, groupDTOs, err := dc.discoverWithNewFramework(targetID)
+	if err != nil {
+		glog.Errorf("Failed to discover kubernetes cluster: %v", err)
+		return
+	}
+
+	discoveryResponse = &proto.DiscoveryResponse{
 		DiscoveredGroup: groupDTOs,
 		EntityDTO:       newDiscoveryResultDTOs,
 	}
@@ -152,13 +267,13 @@ func (dc *K8sDiscoveryClient) Discover(accountValues []*proto.AccountValue) (*pr
 	newFrameworkDiscTime := time.Now().Sub(currentTime).Seconds()
 	glog.V(2).Infof("Successfully discovered kubernetes cluster in %.3f seconds", newFrameworkDiscTime)
 
-	return discoveryResponse, nil
+	return
 }
 
 /*
 	The actual discovery work is done here.
 */
-func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []*proto.GroupDTO, error) {
+func (dc *K8sDiscoveryClient) discoverWithNewFramework(targetID string) ([]*proto.EntityDTO, []*proto.GroupDTO, error) {
 	// CREATE CLUSTER, NODES, NAMESPACES, QUOTAS, SERVICES HERE
 	kubeCluster, err := dc.clusterProcessor.DiscoverCluster()
 	if err != nil {
@@ -166,36 +281,87 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []
 	}
 	clusterSummary := repository.CreateClusterSummary(kubeCluster)
 
+	// Cache operatorResourceSpecMap in ormClient
+	numCRs := dc.config.ormClient.CacheORMSpecMap()
+	if numCRs > 0 {
+		glog.Infof("Discovered %v Operator managed Custom Resources in cluster %s.", numCRs, targetID)
+	}
+
 	// Multiple discovery workers to create node and pod DTOs
 	nodes := clusterSummary.NodeList
 	// Call cache cleanup
 	dc.config.probeConfig.NodeClient.CleanupCache(nodes)
+	// Stops scheduling dispatcher to assign sampling discovery tasks.
+	dc.samplingDispatcher.FinishSampling()
 
-	// Discover pods and create DTOs for nodes, pods, containers, application.
-	// Collect the kubePod, quota metrics, groups from all the discovery workers
-	workerCount := dc.dispatcher.Dispatch(nodes, clusterSummary)
-	entityDTOs, podEntitiesMap, quotaMetricsList, policyGroupList := dc.resultCollector.Collect(workerCount)
+	// Discover pods and create DTOs for nodes, namespaces, controllers, pods, containers, application.
+	// Merge collected usage data samples from globalEntityMetricSink into the metric sink of each individual discovery worker.
+	// Collect the kubePod, kubeNamespace metrics, groups and kubeControllers from all the discovery workers.
+	taskCount := dc.dispatcher.Dispatch(nodes, clusterSummary)
+	result := dc.resultCollector.Collect(taskCount)
 
-	// Quota discovery worker to create quota DTOs
+	// Clear globalEntityMetricSink cache after collecting full discovery results
+	dc.globalEntityMetricSink.ClearCache()
+	// Reschedule dispatch sampling discovery tasks for newly discovered nodes
+	dc.samplingDispatcher.ScheduleDispatch(nodes)
+
+	// Namespace discovery worker to create namespace DTOs
 	stitchType := dc.config.probeConfig.StitchingPropertyType
-	quotasDiscoveryWorker := worker.Newk8sResourceQuotasDiscoveryWorker(clusterSummary, stitchType)
-	quotaDtos, _ := quotasDiscoveryWorker.Do(quotaMetricsList)
+	namespacesDiscoveryWorker := worker.Newk8sNamespaceDiscoveryWorker(clusterSummary, stitchType)
+	namespaceDtos, err := namespacesDiscoveryWorker.Do(result.NamespaceMetrics)
+	if err != nil {
+		glog.Errorf("Failed to discover namespaces from current Kubernetes cluster with the new discovery framework: %s", err)
+	} else {
+		glog.V(2).Infof("There are %d namespace entityDTOs.", len(namespaceDtos))
+		result.EntityDTOs = append(result.EntityDTOs, namespaceDtos...)
+	}
+
+	// K8s workload controller discovery worker to create WorkloadController DTOs
+	controllerDiscoveryWorker := worker.NewK8sControllerDiscoveryWorker(clusterSummary)
+	workloadControllerDtos, err := controllerDiscoveryWorker.Do(result.KubeControllers)
+	if err != nil {
+		glog.Errorf("Failed to discover workload controllers from current Kubernetes cluster with the new discovery framework: %s", err)
+	} else {
+		glog.V(2).Infof("There are %d WorkloadController entityDTOs.", len(workloadControllerDtos))
+		result.EntityDTOs = append(result.EntityDTOs, workloadControllerDtos...)
+	}
+
+	// K8s container spec discovery worker to create ContainerSpec DTOs by aggregating commodities data of container
+	// replicas. ContainerSpec is an entity type which represents a certain type of container replicas deployed by a
+	// K8s controller.
+	containerSpecDiscoveryWorker := worker.NewK8sContainerSpecDiscoveryWorker()
+	containerSpecDtos, err := containerSpecDiscoveryWorker.Do(result.ContainerSpecMetrics, dc.config.containerUtilizationDataAggStrategy,
+		dc.config.containerUsageDataAggStrategy)
+	if err != nil {
+		glog.Errorf("Failed to discover ContainerSpecs from current Kubernetes cluster with the new discovery framework: %s", err)
+	} else {
+		glog.V(2).Infof("There are %d ContainerSpec entityDTOs", len(containerSpecDtos))
+		result.EntityDTOs = append(result.EntityDTOs, containerSpecDtos...)
+	}
 
 	// Service DTOs
 	glog.V(2).Infof("Begin to generate service EntityDTOs.")
 	svcDiscWorker := worker.Newk8sServiceDiscoveryWorker(clusterSummary)
-	serviceDtos, err := svcDiscWorker.Do(podEntitiesMap)
+	serviceDtos, err := svcDiscWorker.Do(result.PodEntitiesMap)
 	if err != nil {
 		glog.Errorf("Failed to discover services from current Kubernetes cluster with the new discovery framework: %s", err)
 	} else {
-		glog.V(2).Infof("There are %d vApp entityDTOs.", len(serviceDtos))
-		entityDTOs = append(entityDTOs, serviceDtos...)
+		glog.V(2).Infof("There are %d service entityDTOs.", len(serviceDtos))
+		result.EntityDTOs = append(result.EntityDTOs, serviceDtos...)
 	}
 
-	// All the DTOs
-	entityDTOs = append(entityDTOs, quotaDtos...)
+	glog.V(2).Infof("Begin to generate persistent volume EntityDTOs.")
+	// Persistent Volume DTOs
+	volumeEntityDTOBuilder := dtofactory.NewVolumeEntityDTOBuilder(result.PodVolumeMetrics)
+	volumeEntityDTOs, err := volumeEntityDTOBuilder.BuildEntityDTOs(clusterSummary.VolumeToPodsMap)
+	if err != nil {
+		glog.Errorf("Error while creating volume entityDTOs: %v", err)
+	} else {
+		glog.V(2).Infof("There are %d Storage Volume entityDTOs.", len(volumeEntityDTOs))
+		result.EntityDTOs = append(result.EntityDTOs, volumeEntityDTOs...)
+	}
 
-	glog.V(2).Infof("There are totally %d entityDTOs.", len(entityDTOs))
+	glog.V(2).Infof("There are totally %d entityDTOs.", len(result.EntityDTOs))
 
 	// affinity process
 	glog.V(2).Infof("Begin to process affinity.")
@@ -204,7 +370,7 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []
 	if err != nil {
 		glog.Errorf("Failed during process affinity rules: %s", err)
 	} else {
-		entityDTOs = affinityProcessor.ProcessAffinityRules(entityDTOs)
+		result.EntityDTOs = affinityProcessor.ProcessAffinityRules(result.EntityDTOs)
 	}
 	glog.V(2).Infof("Successfully processed affinity.")
 
@@ -218,20 +384,19 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []
 		glog.Errorf("Failed during process taints and tolerations: %v", err)
 	} else {
 		// Add access commodities to entity DOTs based on the taint-toleration rules
-		taintTolerationProcessor.Process(entityDTOs)
+		taintTolerationProcessor.Process(result.EntityDTOs)
 	}
 
 	// Anti-Affinity policy to prevent pods on unschedulable nodes to move to other unschedulable nodes
-	targetId := dc.config.targetConfig.TargetIdentifier
-	nodesAntiAffinityGroupBuilder := compliance.NewUnschedulableNodesAntiAffinityGroupDTOBuilder(clusterSummary, targetId,
-		nodesManager)
+	nodesAntiAffinityGroupBuilder := compliance.NewUnschedulableNodesAntiAffinityGroupDTOBuilder(
+		clusterSummary, targetID, nodesManager)
 	nodeAntiAffinityGroupDTOs := nodesAntiAffinityGroupBuilder.Build()
 
 	glog.V(2).Infof("Successfully processed taints and tolerations.")
 
 	// Discovery worker for creating Group DTOs
-	entityGroupDiscoveryWorker := worker.Newk8sEntityGroupDiscoveryWorker(clusterSummary, targetId)
-	groupDTOs, _ := entityGroupDiscoveryWorker.Do(policyGroupList)
+	entityGroupDiscoveryWorker := worker.Newk8sEntityGroupDiscoveryWorker(clusterSummary, targetID)
+	groupDTOs, _ := entityGroupDiscoveryWorker.Do(result.EntityGroups)
 
 	glog.V(2).Infof("There are totally %d groups DTOs", len(groupDTOs))
 	if glog.V(4) {
@@ -243,5 +408,6 @@ func (dc *K8sDiscoveryClient) discoverWithNewFramework() ([]*proto.EntityDTO, []
 	}
 
 	groupDTOs = append(groupDTOs, nodeAntiAffinityGroupDTOs...)
-	return entityDTOs, groupDTOs, nil
+
+	return result.EntityDTOs, groupDTOs, nil
 }

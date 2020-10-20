@@ -192,3 +192,34 @@ func TestBuildCommBought(t *testing.T) {
 		fmt.Printf("%++v\n", err)
 	}
 }
+
+func TestMetricValueWithMultiplePoints(t *testing.T) {
+	metricsSink = metrics.NewEntityMetricSink().WithMaxMetricPointsSize(3)
+	containerId := "container"
+	cpuUsedMetric1 := metrics.NewEntityResourceMetric(metrics.ContainerType, containerId, metrics.CPU, metrics.Used,
+		[]metrics.Point{{
+			Value:     2,
+			Timestamp: 1,
+		}})
+	cpuUsedMetric2 := metrics.NewEntityResourceMetric(metrics.ContainerType, containerId, metrics.CPU, metrics.Used,
+		[]metrics.Point{{
+			Value:     4,
+			Timestamp: 2,
+		}})
+	cpuUsedMetric3 := metrics.NewEntityResourceMetric(metrics.ContainerType, containerId, metrics.CPU, metrics.Used,
+		[]metrics.Point{{
+			Value:     3,
+			Timestamp: 3,
+		}})
+	metricsSink.AddNewMetricEntries(cpuUsedMetric1)
+	metricsSink.UpdateMetricEntry(cpuUsedMetric2)
+	metricsSink.UpdateMetricEntry(cpuUsedMetric3)
+
+	dtoBuilder := &generalBuilder{
+		metricsSink: metricsSink,
+	}
+
+	metricValue, _ := dtoBuilder.metricValue(metrics.ContainerType, containerId, metrics.CPU, metrics.Used, nil)
+	assert.EqualValues(t, 3, int(metricValue.Avg))
+	assert.EqualValues(t, 4, int(metricValue.Peak))
+}

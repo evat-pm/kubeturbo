@@ -1,6 +1,8 @@
 package dtofactory
 
 import (
+	"math"
+
 	"github.com/turbonomic/kubeturbo/pkg/discovery/metrics"
 	sdkbuilder "github.com/turbonomic/turbo-go-sdk/pkg/builder"
 
@@ -21,11 +23,13 @@ var (
 		metrics.CPUProvisioned:     proto.CommodityDTO_CPU_PROVISIONED,
 		metrics.MemoryProvisioned:  proto.CommodityDTO_MEM_PROVISIONED,
 		metrics.Transaction:        proto.CommodityDTO_TRANSACTION,
-		metrics.CPUQuota:           proto.CommodityDTO_CPU_ALLOCATION,
-		metrics.MemoryQuota:        proto.CommodityDTO_MEM_ALLOCATION,
-		metrics.CPURequestQuota:    proto.CommodityDTO_CPU_REQUEST_ALLOCATION,
-		metrics.MemoryRequestQuota: proto.CommodityDTO_MEM_REQUEST_ALLOCATION,
+		metrics.CPULimitQuota:      proto.CommodityDTO_VCPU_LIMIT_QUOTA,
+		metrics.MemoryLimitQuota:   proto.CommodityDTO_VMEM_LIMIT_QUOTA,
+		metrics.CPURequestQuota:    proto.CommodityDTO_VCPU_REQUEST_QUOTA,
+		metrics.MemoryRequestQuota: proto.CommodityDTO_VMEM_REQUEST_QUOTA,
 		metrics.NumPods:            proto.CommodityDTO_NUMBER_CONSUMERS,
+		metrics.VStorage:           proto.CommodityDTO_VSTORAGE,
+		metrics.StorageAmount:      proto.CommodityDTO_STORAGE_AMOUNT,
 	}
 )
 
@@ -144,25 +148,25 @@ func (builder generalBuilder) getSoldResourceCommodityWithKey(entityType metrics
 
 	commSoldBuilder := sdkbuilder.NewCommodityDTOBuilder(cType)
 
-	// set used value
-	usedValue, err := builder.metricValue(entityType, entityID,
+	metricValue, err := builder.metricValue(entityType, entityID,
 		resourceType, metrics.Used, converter)
 	if err != nil {
 		return nil, fmt.Errorf("%s", err)
 	}
 
-	commSoldBuilder.Used(usedValue)
-
-	// set peak value as the used value
-	commSoldBuilder.Peak(usedValue)
+	// Set used value as the average of multiple used metric points
+	commSoldBuilder.Used(metricValue.Avg)
+	// Set peak value as the peak of multiple used metric points
+	commSoldBuilder.Peak(metricValue.Peak)
 
 	// set capacity value
-	capacityValue, err := builder.metricValue(entityType, entityID,
+	capacityMetricValue, err := builder.metricValue(entityType, entityID,
 		resourceType, metrics.Capacity, converter)
 	if err != nil {
 		return nil, fmt.Errorf("%s", err)
 	}
-	commSoldBuilder.Capacity(capacityValue)
+	// Capacity metric is always a single data point. Use Avg to refer to the single point value
+	commSoldBuilder.Capacity(capacityMetricValue.Avg)
 
 	// set additional attribute
 	if commodityAttrSetter != nil && commodityAttrSetter.Settable(resourceType) {
@@ -181,19 +185,41 @@ func (builder generalBuilder) getSoldResourceCommodityWithKey(entityType metrics
 
 func (builder generalBuilder) metricValue(entityType metrics.DiscoveredEntityType, entityID string,
 	resourceType metrics.ResourceType, metricProp metrics.MetricProp,
-	converter *converter) (float64, error) {
+	converter *converter) (metrics.MetricValue, error) {
+	metricValue := metrics.MetricValue{}
 
 	metricUID := metrics.GenerateEntityResourceMetricUID(entityType, entityID, resourceType, metricProp)
 	metric, err := builder.metricsSink.GetMetric(metricUID)
 	if err != nil {
-		return 0, fmt.Errorf("missing metrics %s", metricProp)
+		return metricValue, fmt.Errorf("missing metrics %s", metricProp)
 	}
-	metricValue := metric.GetValue().(float64)
+
+	value := metric.GetValue()
+	switch value.(type) {
+	case []metrics.Point:
+		var sum float64
+		var peak float64
+		for _, point := range value.([]metrics.Point) {
+			sum += point.Value
+			peak = math.Max(peak, point.Value)
+		}
+		metricValue.Avg = sum / float64(len(value.([]metrics.Point)))
+		metricValue.Peak = peak
+	case float64:
+		metricValue.Avg = value.(float64)
+		metricValue.Peak = value.(float64)
+	default:
+		return metricValue, fmt.Errorf("unsupported metric value type %t", metric.GetValue())
+	}
 	if converter != nil && converter.Convertible(resourceType) {
-		oldValue := metricValue
-		metricValue = converter.Convert(resourceType, metricValue)
-		glog.V(4).Infof("%s:%s converted %s:%s value from %f to %f", entityType, entityID,
-			resourceType, metricProp, oldValue, metricValue)
+		oldAvgValue := metricValue.Avg
+		oldPeakValue := metricValue.Peak
+		metricValue.Avg = converter.Convert(resourceType, metricValue.Avg)
+		metricValue.Peak = converter.Convert(resourceType, metricValue.Peak)
+		glog.V(4).Infof("%s:%s converted %s:%s average value from %f to %f", entityType, entityID,
+			resourceType, metricProp, oldAvgValue, metricValue.Avg)
+		glog.V(4).Infof("%s:%s converted %s:%s peak value from %f to %f", entityType, entityID,
+			resourceType, metricProp, oldPeakValue, metricValue.Peak)
 	}
 
 	return metricValue, nil
@@ -213,35 +239,17 @@ func (builder generalBuilder) getResourceCommoditiesBought(entityType metrics.Di
 		commBoughtBuilder := sdkbuilder.NewCommodityDTOBuilder(cType)
 
 		// set used value
-		usedValue, err := builder.metricValue(entityType, entityID, rType, metrics.Used, converter)
+		metricValue, err := builder.metricValue(entityType, entityID, rType, metrics.Used, converter)
 		if err != nil {
 			// skip this commodity
 			glog.Errorf("%s::%s cannot build bought commodity %s : missing metrics %s",
 				entityType, entityID, rType, metrics.Used)
 			continue
 		}
-		commBoughtBuilder.Used(usedValue)
+		commBoughtBuilder.Used(metricValue.Avg)
 
 		// set peak value as the used value
-		commBoughtBuilder.Peak(usedValue)
-
-		// set reservation value if any
-		reservedMetricUID := metrics.GenerateEntityResourceMetricUID(entityType, entityID,
-			rType, metrics.Reservation)
-		reservedMetric, err := builder.metricsSink.GetMetric(reservedMetricUID)
-		if err != nil {
-			// not every commodity has reserved value.
-			glog.V(4).Infof("%s::%s Reservation not set for commodity %s: %s",
-				entityType, entityID, rType, err)
-		} else {
-			reservedValue := reservedMetric.GetValue().(float64)
-			if reservedValue != 0 {
-				if converter != nil && converter.Convertible(rType) {
-					reservedValue = converter.Convert(rType, reservedValue)
-				}
-				commBoughtBuilder.Reservation(reservedValue)
-			}
-		}
+		commBoughtBuilder.Peak(metricValue.Peak)
 
 		// set additional attribute
 		if commodityAttrSetter != nil && commodityAttrSetter.Settable(rType) {
@@ -274,26 +282,18 @@ func (builder generalBuilder) getResourceCommodityBoughtWithKey(entityType metri
 	}
 
 	commBoughtBuilder := sdkbuilder.NewCommodityDTOBuilder(cType)
-	// set used value
-	usedValue, err := builder.metricValue(entityType, entityID,
+
+	metricValue, err := builder.metricValue(entityType, entityID,
 		resourceType, metrics.Used, converter)
 	if err != nil {
 		return nil, fmt.Errorf("%s", err)
 	}
 
-	commBoughtBuilder.Used(usedValue)
+	// Set used value as the average of multiple usage metric points
+	commBoughtBuilder.Used(metricValue.Avg)
+	// Set peak value as the peak of multiple usage metric points
+	commBoughtBuilder.Peak(metricValue.Peak)
 
-	// set peak value as the used value
-	commBoughtBuilder.Peak(usedValue)
-
-	// set reservation value if any
-	reservationValue, _ := builder.metricValue(entityType, entityID,
-		resourceType, metrics.Reservation, converter)
-	if reservationValue != 0 {
-		glog.V(4).Infof("%s::%s Reservation set for commodity %s: %s",
-			entityType, entityID, resourceType, err)
-		commBoughtBuilder.Reservation(reservationValue)
-	}
 	// set additional attribute
 	if commodityAttrSetter != nil && commodityAttrSetter.Settable(resourceType) {
 		commodityAttrSetter.Set(resourceType, commBoughtBuilder)

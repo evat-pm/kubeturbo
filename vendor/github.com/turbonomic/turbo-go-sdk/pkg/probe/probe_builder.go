@@ -7,16 +7,17 @@ import (
 )
 
 type ProbeBuilder struct {
-	probeConf              *ProbeConfig
-	registrationClient     TurboRegistrationClient
-	targetsToAdd           map[string]bool
-	discoveryClient        TurboDiscoveryClient
-	actionClient           TurboActionExecutorClient
-	builderError           error
-	supplyChainProvider    ISupplyChainProvider
-	accountDefProvider     IAccountDefinitionProvider
-	actionPolicyProvider   IActionPolicyProvider
-	entityMetadataProvider IEntityMetadataProvider
+	probeConf                 *ProbeConfig
+	registrationClient        TurboRegistrationClient
+	targetsToAdd              map[string]bool
+	discoveryClient           TurboDiscoveryClient
+	actionClient              TurboActionExecutorClient
+	builderError              error
+	supplyChainProvider       ISupplyChainProvider
+	accountDefProvider        IAccountDefinitionProvider
+	actionPolicyProvider      IActionPolicyProvider
+	actionMergePolicyProvider IActionMergePolicyProvider
+	entityMetadataProvider    IEntityMetadataProvider
 }
 
 func ErrorInvalidTargetIdentifier() error {
@@ -29,6 +30,10 @@ func ErrorInvalidProbeType() error {
 
 func ErrorInvalidProbeCategory() error {
 	return errors.New("Null Probe category")
+}
+
+func ErrorInvalidProbeUICategory() error {
+	return errors.New("Null Probe UI category")
 }
 
 func ErrorInvalidRegistrationClient() error {
@@ -52,11 +57,11 @@ func ErrorCreatingProbe(probeType string, probeCategory string) error {
 }
 
 // Get an instance of ProbeBuilder
-func NewProbeBuilder(probeType string, probeCategory string) *ProbeBuilder {
+func NewProbeBuilder(probeType, probeCategory, probeUICategory string) *ProbeBuilder {
 	probeBuilder := &ProbeBuilder{}
 
 	// Validate probe type and category
-	probeConf, err := NewProbeConfig(probeType, probeCategory)
+	probeConf, err := NewProbeConfig(probeType, probeCategory, probeUICategory)
 	if err != nil {
 		glog.Errorf("Encountered error constructing NewProbeBuilder: %v", err)
 		probeBuilder.builderError = err
@@ -100,6 +105,10 @@ func (pb *ProbeBuilder) Create() (*TurboProbe, error) {
 
 	if pb.actionPolicyProvider != nil {
 		turboProbe.RegistrationClient.IActionPolicyProvider = pb.actionPolicyProvider
+	}
+
+	if pb.actionMergePolicyProvider != nil {
+		turboProbe.RegistrationClient.IActionMergePolicyProvider = pb.actionMergePolicyProvider
 	}
 
 	if pb.entityMetadataProvider != nil {
@@ -152,6 +161,17 @@ func (pb *ProbeBuilder) WithActionPolicies(actionPolicyProvider IActionPolicyPro
 		return pb
 	}
 	pb.actionPolicyProvider = actionPolicyProvider
+
+	return pb
+}
+
+// Set the provider for the action merge policies
+func (pb *ProbeBuilder) WithActionMergePolicies(actionMergePolicyProvider IActionMergePolicyProvider) *ProbeBuilder {
+	if actionMergePolicyProvider == nil {
+		pb.builderError = ErrorInvalidRegistrationClient()
+		return pb
+	}
+	pb.actionMergePolicyProvider = actionMergePolicyProvider
 
 	return pb
 }
