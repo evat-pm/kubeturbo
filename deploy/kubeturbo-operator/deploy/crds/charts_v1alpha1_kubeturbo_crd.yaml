@@ -17,3 +17,101 @@ spec:
   - name: v1alpha1
     served: true
     storage: true
+  validation:
+    openAPIV3Schema:
+      type: object
+      properties:
+        apiVersion:
+          description: 'APIVersion defines the versioned schema of this representation
+            of an object. Servers should convert recognized schemas to the latest
+            internal value, and may reject unrecognized values.
+            More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#resources'
+          type: string
+        kind:
+          description: 'Kind is a string value representing the REST resource this
+            object represents. Servers may infer this from the endpoint the client
+            submits requests to. Cannot be updated. In CamelCase.
+            More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#types-kinds'
+          type: string
+        metadata:
+          type: object
+        spec:
+          properties:
+            image:
+              description: Kubeturbo image details for deployments outside of RH Operator Hub
+              properties:
+                repository:
+                  description: container repository. default is RHCC for Operator Hub, docker hub all else
+                  type: string
+                tag:
+                  description: kubeturbo container image tag
+                  type: string
+                pullPolicy:
+                  description: define pull policy, Always is default
+                  type: string
+            serverMeta:
+              description: Configuration to Turbo Server
+              properties:
+                version:
+                  description: Turbo Server major version
+                  type: string
+                turboServer:
+                  description: URL for Turbo Server endpoint
+                  type: string
+            restAPIConfig:
+              description: Credentials to register probe with Turbo Server
+              properties:
+                turbonomicCredentialsSecretName:
+                  description: name of file that contains the k8s opaque secret
+                  type: string
+                opsManagerUserName:
+                  description: Turbo admin role user id
+                  type: string
+                opsManagerPassword:
+                  description: Turbo admin role user password
+                  type: string
+            HANodeConfig:
+              description: create HA Node to ESX placement policy by node role. Master is default
+              properties:
+                nodeRoles:
+                  description: node role names
+                  type: string, quote
+            args:
+              description: container spec arguments
+              properties:
+                sccsupport:
+                  description: allow kubeturbo to execute actions in OCP
+                  type: string
+                logginglevel:
+                  description: define verbose logging level, default is info = 2
+                  type: integer
+                kubelethttps:
+                  description: identify if using https client
+                  type: boolean
+                kubeletport:
+                  description: identify kubelet port
+                  type: interger
+                stitchuuid:
+                  description: identify if using uuid or ip for stitching
+                  type: boolean
+            resources:
+              description: container spec arguments for resources
+              properties:
+                limits:
+                  description: define limits
+                  properties:
+                    memory:
+                      description: define memory limits in Gi or Mi, include units
+                      type: string
+                    cpu:
+                      description: define cpu limits in cores or millicores, include units
+                      type: string
+                requests:
+                  description: define requests
+                  properties:
+                    memory:
+                      description: define memory requests in Gi or Mi, include units
+                      type: string
+                    cpu:
+                      description: define cpu requests in cores or millicores, include units
+                      type: string

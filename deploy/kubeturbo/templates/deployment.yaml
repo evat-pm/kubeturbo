@@ -33,6 +33,9 @@ spec:
           args:
             - --turboconfig=/etc/kubeturbo/turbo.config
             - --v={{ .Values.args.logginglevel }}
+          {{ -if .Values.args.sccsupport }}
+            - --scc-support={{ .Values.args.sccsupport }}
+          {{- end }}
           {{- if .Values.args.kubelethttps }}
             - --kubelet-https={{ .Values.args.kubelethttps }}
             - --kubelet-port={{ .Values.args.kubeletport }}
@@ -43,6 +46,10 @@ spec:
           {{- if .Values.args.pre16k8sVersion }}
             - --k8sVersion=1.5
           {{- end }}
+{{- if .Values.resources }}
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+{{- end }}
           volumeMounts:
           - name: turbo-volume
             mountPath: /etc/kubeturbo
